@@ -81,3 +81,7 @@ wandb/
 
 # Misc
 .claude/
+
+# needed
+sapiens2_host/
+pose/outputs/

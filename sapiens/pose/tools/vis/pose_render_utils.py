@@ -22,6 +22,7 @@ def visualize_keypoints(
     kpt_color: list | tuple | np.ndarray | None = None,
     link_color: list | tuple | np.ndarray | None = None,
     show_kpt_idx: bool = False,
+    kpt_labels: list | None = None,
 ) -> np.ndarray:
     img = image.copy()
     H, W = img.shape[:2]
@@ -106,13 +107,24 @@ def visualize_keypoints(
 
             c = kpt_colors[min(j_idx, len(kpt_colors) - 1)]
             cv2.circle(img, (x, y), radius, c, thickness=-1, lineType=cv2.LINE_AA)
-            if show_kpt_idx:
+            if show_kpt_idx or kpt_labels is not None:
+                label = kpt_labels[j_idx] if kpt_labels is not None else str(j_idx)
                 cv2.putText(
                     img,
-                    str(j_idx),
-                    (x + radius, y - radius),
+                    str(label),
+                    (x + radius + 2, y - radius),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.4,
+                    0.35,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                cv2.putText(
+                    img,
+                    str(label),
+                    (x + radius + 2, y - radius),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.35,
                     c,
                     1,
                     cv2.LINE_AA,

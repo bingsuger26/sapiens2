@@ -25,7 +25,6 @@ from sapiens.pose.models import init_model
 from tqdm import tqdm
 
 from pose_render_utils import visualize_keypoints
-from plot_metrics import plot_action_metrics
 
 try:
     from mmdet.apis import inference_detector, init_detector
@@ -101,14 +100,12 @@ class PointingActionDetector:
 
     def __init__(
         self,
-        ratio_thr: float = 4.0,
-        vel_min: float = 0.025,
+        ratio_thr: float = 2.2,
         confirm_frames: int = 3,
         history_len: int = 3,
-        pos_diff_thr: float = 0.1,
+        pos_diff_thr: float = 0.15,
     ):
         self.ratio_thr = ratio_thr
-        self.vel_min = vel_min  # min wrist speed for either hand
         self.confirm_frames = confirm_frames
         self.history_len = history_len
         self.pos_diff_thr = pos_diff_thr  # min position change between transitions
@@ -199,16 +196,18 @@ class PointingActionDetector:
     def update(self, kpts, scores, kpt_thr=0.3):
         """Process one frame and return the action label.
 
-        The transition criterion requires **all** of the following to hold
-        for ``confirm_frames`` (default 3) consecutive frames:
-          1. vel_ratio >= ratio_thr  (one wrist moves much faster than the other)
-          2. max(vel_left, vel_right) >= vel_min  (at least one wrist is actually moving)
+        The transition criterion is based on the **ratio** between the two
+        wrist velocities:
+          - ratio >= ratio_thr (default 2.2) for 3 consecutive frames
+            means one arm is moving much faster → asymmetric motion detected.
+          - ratio <  ratio_thr for 3 consecutive frames
+            means both arms move at similar speed → symmetric / stable.
 
         State machine:
-          idle     → raising   : asymmetric for 3 frames
-          raising  → pointing  : symmetric  for 3 frames
-          pointing → lowering  : asymmetric for 3 frames
-          lowering → idle      : symmetric  for 3 frames
+          idle     → raising   : ratio >= thr for 3 frames
+          raising  → pointing  : ratio <  thr for 3 frames
+          pointing → lowering  : ratio >= thr for 3 frames
+          lowering → idle      : ratio <  thr for 3 frames
         """
         anchor, lw_rel, rw_rel, anchor_scale = self._compute_anchor_and_rel(
             kpts, scores, kpt_thr
@@ -231,18 +230,8 @@ class PointingActionDetector:
             "state_before": self.state,
         }
 
-        # Determine whether the current frame satisfies "asymmetric" condition:
-        # ratio must exceed threshold AND at least one wrist must be moving fast enough
-        is_asymmetric = (
-            ratio >= self.ratio_thr
-            and max(vel_left, vel_right) >= self.vel_min
-        )
-
-        # Symmetric = both conditions are NOT met (hands truly stable)
-        is_symmetric = (
-            ratio < self.ratio_thr
-            and max(vel_left, vel_right) < self.vel_min
-        )
+        # Determine whether the current frame satisfies "asymmetric" condition
+        is_asymmetric = (ratio >= self.ratio_thr)
 
         # Current wrist positions snapshot (for position-diff check)
         cur_pos = (lw_rel, rw_rel)
@@ -293,7 +282,7 @@ class PointingActionDetector:
 
         elif self.state == self.RAISING:
             # raising → pointing: symmetric for confirm_frames
-            if is_symmetric:
+            if not is_asymmetric:
                 self._confirm_count += 1
                 if self._confirm_count >= self.confirm_frames:
                     _try_transition(self.POINTING)
@@ -311,7 +300,7 @@ class PointingActionDetector:
 
         elif self.state == self.LOWERING:
             # lowering → idle: symmetric for confirm_frames
-            if is_symmetric:
+            if not is_asymmetric:
                 self._confirm_count += 1
                 if self._confirm_count >= self.confirm_frames:
                     _try_transition(self.IDLE)
@@ -340,19 +329,22 @@ def mmdet_pipeline(cfg):
     return cfg
 
 
-def _run_pose_on_bboxes(bboxes, image, model):
-    """Run pose estimation on pre-computed bboxes (shared by both pipelines).
-
-    Args:
-        bboxes: np.ndarray, shape (N, 4), format [x1, y1, x2, y2].
-        image: np.ndarray, BGR image (H, W, 3).
-        model: pose estimation model.
-
-    Returns:
-        keypoints, keypoint_scores, bboxes
-    """
+def process_one_image(args, image, detector, model):
     image_w, image_h = image.shape[1], image.shape[0]
+    det_result = inference_detector(detector, image)
+    pred_instance = det_result.pred_instances.cpu().numpy()
+    bboxes = np.concatenate(
+        (pred_instance.bboxes, pred_instance.scores[:, None]), axis=1
+    )
+    bboxes = bboxes[
+        np.logical_and(
+            pred_instance.labels == 0,  ## 0 is the person class
+            pred_instance.scores > args.bbox_thr,
+        )
+    ]
 
+    bboxes = bboxes[nms(bboxes, args.nms_thr), :4]  ## B x 4; x1, y1, x2, y2
+    # get bbox from the image size
     if bboxes is None or len(bboxes) == 0:
         bboxes = np.array([[0, 0, image_w - 1, image_h - 1]], dtype=np.float32)
 
@@ -408,90 +400,16 @@ def _run_pose_on_bboxes(bboxes, image, model):
     return keypoints, keypoint_scores, bboxes
 
 
-def process_one_image(args, image, detector, model):
-    """Detect persons with RTMDet, then run pose estimation."""
-    det_result = inference_detector(detector, image)
-    pred_instance = det_result.pred_instances.cpu().numpy()
-    bboxes = np.concatenate(
-        (pred_instance.bboxes, pred_instance.scores[:, None]), axis=1
-    )
-    bboxes = bboxes[
-        np.logical_and(
-            pred_instance.labels == 0,  ## 0 is the person class
-            pred_instance.scores > args.bbox_thr,
-        )
-    ]
-    bboxes = bboxes[nms(bboxes, args.nms_thr), :4]  ## B x 4; x1, y1, x2, y2
-
-    return _run_pose_on_bboxes(bboxes, image, model)
-
-
-def process_one_image_with_bbox(image, bboxes, model):
-    """Run pose estimation with externally provided bboxes (no detector needed).
-
-    Args:
-        image: np.ndarray, BGR image (H, W, 3).
-        bboxes: np.ndarray, shape (N, 4), format [x1, y1, x2, y2].
-        model: pose estimation model.
-
-    Returns:
-        keypoints, keypoint_scores, bboxes
-    """
-    return _run_pose_on_bboxes(bboxes, image, model)
-
-
-def load_track_json(track_json_path):
-    """Load a track.json file and return a dict mapping frame_index -> list of
-    person bboxes (each bbox is [x1, y1, x2, y2] as np.float32).
-
-    Args:
-        track_json_path: path to the track.json file.
-
-    Returns:
-        dict[int, np.ndarray]: frame_index -> bboxes array of shape (N, 4).
-    """
-    with open(track_json_path, "r") as f:
-        data = json.load(f)
-
-    frame_bboxes = {}
-    for frame in data["track_data"]:
-        fidx = frame["frame_index"]
-        persons = frame.get("person_detections", [])
-        if persons:
-            bboxes = np.array(
-                [p["bbox_xyxy"] for p in persons], dtype=np.float32
-            )
-        else:
-            bboxes = np.empty((0, 4), dtype=np.float32)
-        frame_bboxes[fidx] = bboxes
-
-    return frame_bboxes
-
-
-# -------------------------------------------------------------------------------
-def _frame_index_from_name(image_name):
-    """Extract integer frame index from an image filename like '00001.png'."""
-    stem = os.path.splitext(image_name)[0]
-    return int(stem)
-
-
 # -------------------------------------------------------------------------------
 def main():
     parser = ArgumentParser()
-    parser.add_argument("det_config", nargs="?", default=None,
-                        help="Config file for detection (not needed with --track-json)")
-    parser.add_argument("det_checkpoint", nargs="?", default=None,
-                        help="Checkpoint file for detection (not needed with --track-json)")
+    parser.add_argument("det_config", help="Config file for detection")
+    parser.add_argument("det_checkpoint", help="Checkpoint file for detection")
     parser.add_argument("config", help="Config file")
     parser.add_argument("checkpoint", help="Checkpoint file")
     parser.add_argument("--input", help="Input image dir")
     parser.add_argument("--output", default=None, help="Path to output dir")
     parser.add_argument("--device", default="cuda:0", help="Device used for inference")
-    parser.add_argument(
-        "--track-json", default=None,
-        help="Path to track.json with pre-computed person bboxes. "
-             "When provided, the RTMDet detector is NOT loaded.",
-    )
     parser.add_argument(
         "--radius", type=int, default=3, help="Keypoint radius for visualization"
     )
@@ -517,16 +435,8 @@ def main():
         default=None,
         help="Override predictions JSON filename (used by helper for per-chunk writes).",
     )
-    parser.add_argument(
-        "--no-vis",
-        action="store_true",
-        help="Skip visualization image generation; only produce the JSON output.",
-    )
 
     args = parser.parse_args()
-
-    use_track = args.track_json is not None
-    save_json = (not args.no_save_json) or args.no_vis  # always save JSON in no-vis mode
 
     model = init_model(args.config, args.checkpoint, device=args.device)
     os.makedirs(args.output, exist_ok=True)
@@ -543,18 +453,9 @@ def main():
     assert codec_type == "UDPHeatmap", "Only support UDPHeatmap"
     model.codec = UDPHeatmap(**model.cfg.codec)
 
-    # build detector (only when track.json is NOT provided)
-    detector = None
-    if use_track:
-        print(f"[vis_pose] Using pre-computed bboxes from {args.track_json}")
-        frame_bboxes = load_track_json(args.track_json)
-    else:
-        assert args.det_config and args.det_checkpoint, (
-            "det_config and det_checkpoint are required when --track-json is not provided"
-        )
-        detector = init_detector(args.det_config, args.det_checkpoint, device=args.device)
-        detector.cfg = mmdet_pipeline(detector.cfg)
-        frame_bboxes = None
+    # build detector
+    detector = init_detector(args.det_config, args.det_checkpoint, device=args.device)
+    detector.cfg = mmdet_pipeline(detector.cfg)
 
     # Get image list
     if os.path.isdir(args.input):
@@ -576,7 +477,6 @@ def main():
 
     # Pointing action detector (one per tracked person; here we use person 0)
     action_detector = PointingActionDetector()
-    action_metrics = []  # per-frame metrics for summary plot
 
     # Action label → display color (BGR for cv2)
     ACTION_COLORS = {
@@ -596,16 +496,13 @@ def main():
         image_path = os.path.join(input_dir, image_name)
         image = cv2.imread(image_path)
 
-        if use_track:
-            fidx = _frame_index_from_name(image_name)
-            bboxes = frame_bboxes.get(fidx, np.empty((0, 4), dtype=np.float32))
-            keypoints, keypoint_scores, bboxes = process_one_image_with_bbox(
-                image, bboxes, model
-            )
-        else:
-            keypoints, keypoint_scores, bboxes = process_one_image(
-                args, image, detector, model
-            )
+        # try:
+        keypoints, keypoint_scores, bboxes = process_one_image(
+            args, image, detector, model
+        )
+        # except Exception as e:
+        #     print(f"[vis_pose] inference failed on {image_name}: {e}")
+        #     continue
 
         if image_size is None:
             image_size = [int(image.shape[0]), int(image.shape[1])]
@@ -622,74 +519,63 @@ def main():
                 kpts_arr, scores_arr, kpt_thr=args.kpt_thr
             )
 
-        # Collect per-frame metrics
-        action_metrics.append({
-            "frame": _frame_index_from_name(image_name) if use_track else len(action_metrics) + 1,
-            "vel_ratio": action_debug.get("vel_ratio", 0.0),
-            "vel_left": action_debug.get("vel_left", 0.0),
-            "vel_right": action_debug.get("vel_right", 0.0),
-            "state": action_label,
-            "pos_diff": action_debug.get("pos_diff", None),
-        })
-
         # Filter skeleton and colors for arm keypoints
-        if not args.no_vis:
-            arm_skeleton, arm_link_color = filter_skeleton_for_arm(
-                model.pose_metainfo["skeleton_links"],
-                model.pose_metainfo["skeleton_link_colors"],
-            )
-            arm_kpt_color = [model.pose_metainfo["keypoint_colors"][i] for i in ARM_INDICES]
+        arm_skeleton, arm_link_color = filter_skeleton_for_arm(
+            model.pose_metainfo["skeleton_links"],
+            model.pose_metainfo["skeleton_link_colors"],
+        )
+        arm_kpt_color = [model.pose_metainfo["keypoint_colors"][i] for i in ARM_INDICES]
 
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            vis_image_rgb = visualize_keypoints(
-                image=image_rgb,
-                keypoints=keypoints,
-                keypoints_visible=np.ones_like(keypoint_scores) > 0,
-                keypoint_scores=keypoint_scores,
-                radius=args.radius,
-                thickness=args.thickness,
-                kpt_thr=args.kpt_thr,
-                skeleton=arm_skeleton,
-                kpt_color=arm_kpt_color,
-                link_color=arm_link_color,
-                kpt_labels=[str(i) for i in ARM_INDICES],
-            )
-            vis_image = cv2.cvtColor(vis_image_rgb, cv2.COLOR_RGB2BGR)
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        vis_image_rgb = visualize_keypoints(
+            image=image_rgb,
+            keypoints=keypoints,
+            keypoints_visible=np.ones_like(keypoint_scores) > 0,
+            keypoint_scores=keypoint_scores,
+            radius=args.radius,
+            thickness=args.thickness,
+            kpt_thr=args.kpt_thr,
+            skeleton=arm_skeleton,
+            kpt_color=arm_kpt_color,
+            link_color=arm_link_color,
+            kpt_labels=[str(i) for i in ARM_INDICES],
+        )
+        vis_image = cv2.cvtColor(vis_image_rgb, cv2.COLOR_RGB2BGR)
 
-            # --- Draw action label on the image ---
-            label_text = f"Action: {ACTION_LABELS_CN[action_label]}"
-            label_color = ACTION_COLORS[action_label]
-            vel_text = (
-                f"vL={action_debug.get('vel_left', 0):.4f}  "
-                f"vR={action_debug.get('vel_right', 0):.4f}  "
-                f"ratio={action_debug.get('vel_ratio', 0):.2f}"
-            )
-            pos_diff_val = action_debug.get('pos_diff', None)
-            pos_text = (
-                f"pos_diff={pos_diff_val:.4f}  {action_debug.get('pos_check', '')}"
-                if pos_diff_val is not None else ""
-            )
-            # Background rectangle for readability
-            hud_h = 90 if pos_text else 75
-            cv2.rectangle(vis_image, (10, 10), (520, hud_h), (0, 0, 0), -1)
+        # --- Draw action label on the image ---
+        label_text = f"Action: {ACTION_LABELS_CN[action_label]}"
+        label_color = ACTION_COLORS[action_label]
+        vel_text = (
+            f"vL={action_debug.get('vel_left', 0):.4f}  "
+            f"vR={action_debug.get('vel_right', 0):.4f}  "
+            f"ratio={action_debug.get('vel_ratio', 0):.2f}"
+        )
+        pos_diff_val = action_debug.get('pos_diff', None)
+        pos_text = (
+            f"pos_diff={pos_diff_val:.4f}  {action_debug.get('pos_check', '')}"
+            if pos_diff_val is not None else ""
+        )
+        # Background rectangle for readability
+        hud_h = 90 if pos_text else 75
+        cv2.rectangle(vis_image, (10, 10), (520, hud_h), (0, 0, 0), -1)
+        cv2.putText(
+            vis_image, label_text, (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX, 1.0, label_color, 2, cv2.LINE_AA,
+        )
+        cv2.putText(
+            vis_image, vel_text, (20, 65),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1, cv2.LINE_AA,
+        )
+        if pos_text:
             cv2.putText(
-                vis_image, label_text, (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, label_color, 2, cv2.LINE_AA,
+                vis_image, pos_text, (20, 85),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 200, 255), 1, cv2.LINE_AA,
             )
-            cv2.putText(
-                vis_image, vel_text, (20, 65),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1, cv2.LINE_AA,
-            )
-            if pos_text:
-                cv2.putText(
-                    vis_image, pos_text, (20, 85),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 200, 255), 1, cv2.LINE_AA,
-                )
 
-            save_path = os.path.join(args.output, image_name)
-            cv2.imwrite(save_path, vis_image)
+        save_path = os.path.join(args.output, image_name)
+        cv2.imwrite(save_path, vis_image)
 
-        if save_json:
+        if not args.no_save_json:
             try:
                 instances = []
                 for kpts, scores, bbox in zip(keypoints, keypoint_scores, bboxes):
@@ -710,7 +596,7 @@ def main():
             except Exception as e:
                 print(f"[vis_pose] json record failed on {image_name}: {e}")
 
-    if save_json:
+    if not args.no_save_json:
         nn = os.path.basename(os.path.normpath(args.output))
         # strip a trailing "_output" suffix so the JSON sidecar name matches the
         # video basename (e.g. ".../v3/01/<ckpt>_output/01_predictions.json").
@@ -730,16 +616,6 @@ def main():
         with open(json_path, "w") as f:
             json.dump(payload, f)
         print(f"[vis_pose] wrote predictions: {json_path} ({len(frames_records)} frames)")
-
-    # --- Generate action metrics summary plot ---
-    if action_metrics:
-        plot_path = os.path.join(args.output, f"{video_label}_metrics.png")
-        plot_action_metrics(
-            action_metrics, plot_path,
-            ratio_thr=action_detector.ratio_thr,
-            title=video_label,
-        )
-        print(f"[vis_pose] wrote metrics plot: {plot_path}")
 
 
 if __name__ == "__main__":
