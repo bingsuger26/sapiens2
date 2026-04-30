@@ -168,16 +168,20 @@ def process_clip(args, input_dir, output_dir, detector, model,
     action_metrics = []  # per-frame metrics for summary plot
 
     ACTION_COLORS = {
-        PointingActionDetector.IDLE:     (200, 200, 200),
-        PointingActionDetector.RAISING:  (0, 200, 255),
-        PointingActionDetector.POINTING: (0, 255, 0),
-        PointingActionDetector.LOWERING: (0, 0, 255),
+        PointingActionDetector.IDLE:        (200, 200, 200),
+        PointingActionDetector.RAISING:     (0, 200, 255),
+        PointingActionDetector.POINTING:    (0, 255, 0),
+        PointingActionDetector.LOWERING:    (0, 0, 255),
+        PointingActionDetector.BBOX_CHANGE: (255, 0, 255),
+        PointingActionDetector.NO_BBOX:     (128, 128, 128),
     }
     ACTION_LABELS = {
-        PointingActionDetector.IDLE:     "idle",
-        PointingActionDetector.RAISING:  "raising",
-        PointingActionDetector.POINTING: "pointing",
-        PointingActionDetector.LOWERING: "lowering",
+        PointingActionDetector.IDLE:        "idle",
+        PointingActionDetector.RAISING:     "raising",
+        PointingActionDetector.POINTING:    "pointing",
+        PointingActionDetector.LOWERING:    "lowering",
+        PointingActionDetector.BBOX_CHANGE: "bbox_change",
+        PointingActionDetector.NO_BBOX:     "no_bbox",
     }
 
     frames_records = []
@@ -194,9 +198,13 @@ def process_clip(args, input_dir, output_dir, detector, model,
             if frame_bboxes is not None:
                 fidx = _frame_index_from_name(image_name)
                 bboxes = frame_bboxes.get(fidx, np.empty((0, 4), dtype=np.float32))
-                keypoints, keypoint_scores, bboxes = process_one_image_with_bbox(
-                    image, bboxes, model
-                )
+                if len(bboxes) == 0:
+                    # Frame has no annotation in track.json → skip pose estimation
+                    keypoints, keypoint_scores = [], []
+                else:
+                    keypoints, keypoint_scores, bboxes = process_one_image_with_bbox(
+                        image, bboxes, model
+                    )
             else:
                 keypoints, keypoint_scores, bboxes = process_one_image(
                     args, image, detector, model
@@ -213,11 +221,19 @@ def process_clip(args, input_dir, output_dir, detector, model,
         # Action detection
         action_label = PointingActionDetector.IDLE
         action_debug = {}
+        person_bbox = bboxes[0] if len(bboxes) > 0 else None
         if len(keypoints) > 0:
             kpts_arr = np.asarray(keypoints[0])
             scores_arr = np.asarray(keypoint_scores[0])
             action_label, action_debug = action_detector.update(
-                kpts_arr, scores_arr, kpt_thr=args.kpt_thr
+                kpts_arr, scores_arr, bbox=person_bbox, kpt_thr=args.kpt_thr
+            )
+        else:
+            # No person detected → pass dummy kpts with bbox=None to trigger NO_BBOX
+            dummy_kpts = np.zeros((len(ARM_INDICES), 2), dtype=np.float32)
+            dummy_scores = np.zeros(len(ARM_INDICES), dtype=np.float32)
+            action_label, action_debug = action_detector.update(
+                dummy_kpts, dummy_scores, bbox=None, kpt_thr=args.kpt_thr
             )
 
         # Collect per-frame metrics
@@ -228,6 +244,8 @@ def process_clip(args, input_dir, output_dir, detector, model,
             "vel_right": action_debug.get("vel_right", 0.0),
             "state": action_label,
             "pos_diff": action_debug.get("pos_diff", None),
+            "bbox_vel": action_debug.get("bbox_vel", 0.0),
+            "active_side": action_debug.get("active_side", None),
         })
 
         # Visualise
@@ -249,26 +267,32 @@ def process_clip(args, input_dir, output_dir, detector, model,
             vis_image = cv2.cvtColor(vis_image_rgb, cv2.COLOR_RGB2BGR)
 
             # HUD
-            label_text = f"Action: {ACTION_LABELS[action_label]}"
-            label_color = ACTION_COLORS[action_label]
+            side_str = action_debug.get("active_side") or ""
+            side_suffix = f" [{side_str}]" if side_str else ""
+            label_text = f"Action: {ACTION_LABELS.get(action_label, action_label)}{side_suffix}"
+            label_color = ACTION_COLORS.get(action_label, (200, 200, 200))
             vel_text = (
                 f"vL={action_debug.get('vel_left', 0):.4f}  "
                 f"vR={action_debug.get('vel_right', 0):.4f}  "
                 f"ratio={action_debug.get('vel_ratio', 0):.2f}"
             )
+            bbox_vel_val = action_debug.get("bbox_vel", 0.0)
+            bbox_text = f"bbox_vel={bbox_vel_val:.3f}"
             pos_diff_val = action_debug.get("pos_diff", None)
             pos_text = (
                 f"pos_diff={pos_diff_val:.4f}  {action_debug.get('pos_check', '')}"
                 if pos_diff_val is not None else ""
             )
-            hud_h = 90 if pos_text else 75
-            cv2.rectangle(vis_image, (10, 10), (520, hud_h), (0, 0, 0), -1)
+            hud_h = 110 if pos_text else 95
+            cv2.rectangle(vis_image, (10, 10), (560, hud_h), (0, 0, 0), -1)
             cv2.putText(vis_image, label_text, (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, label_color, 2, cv2.LINE_AA)
             cv2.putText(vis_image, vel_text, (20, 65),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
+            cv2.putText(vis_image, bbox_text, (20, 85),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 100), 1, cv2.LINE_AA)
             if pos_text:
-                cv2.putText(vis_image, pos_text, (20, 85),
+                cv2.putText(vis_image, pos_text, (20, 105),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 200, 255), 1, cv2.LINE_AA)
 
             cv2.imwrite(os.path.join(output_dir, image_name), vis_image)
@@ -285,6 +309,7 @@ def process_clip(args, input_dir, output_dir, detector, model,
             frames_records.append({
                 "image_name": image_name,
                 "action": action_label,
+                "active_side": action_debug.get("active_side", None),
                 "action_debug": {
                     k: v for k, v in action_debug.items()
                     if isinstance(v, (int, float, str, type(None)))
@@ -315,6 +340,7 @@ def process_clip(args, input_dir, output_dir, detector, model,
         plot_action_metrics(
             action_metrics, plot_path,
             ratio_thr=action_detector.ratio_thr,
+            bbox_vel_thr=action_detector.bbox_vel_thr,
             title=segment_name,
         )
 

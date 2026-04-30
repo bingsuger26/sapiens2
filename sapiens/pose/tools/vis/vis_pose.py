@@ -68,29 +68,37 @@ _LEFT_WRIST_IDX = ARM_INDICES.index(62)      # 45
 class PointingActionDetector:
     """Rule-based state machine that classifies each frame into one of:
 
-        "idle"      – no pointing action detected
-        "raising"   – hand is being raised (wrist moving fast upward/outward)
-        "pointing"  – hand is held steady in a pointing pose
-        "lowering"  – hand is being lowered back
+        "idle"        – no pointing action detected
+        "raising"     – hand is being raised (wrist moving fast upward/outward)
+        "pointing"    – hand is held steady in a pointing pose
+        "lowering"    – hand is being lowered back
+        "bbox_change" – camera / person is moving too much, skip detection
 
     The detector tracks the *primary wrist* (whichever moves first) and uses
-    velocity in an anchor-relative coordinate system.
+    velocity in an anchor-relative coordinate system.  It also reports which
+    side (left / right) is driving the action.
 
     Parameters
     ----------
-    vel_start_thr : float
-        Minimum wrist speed (anchor-normalised units / frame) to transition
-        from idle → raising.
-    vel_stable_thr : float
-        Speed below which the hand is considered stable (raising → pointing).
-    vel_lower_thr : float
-        Speed above which a downward/inward motion starts (pointing → lowering).
-    stable_frames : int
-        Number of consecutive low-speed frames required to confirm "pointing".
-    cooldown_frames : int
-        Number of consecutive low-speed frames after lowering to return to idle.
+    ratio_thr : float
+        Minimum ratio of faster-wrist-speed to slower-wrist-speed.
+    vel_min : float
+        Minimum wrist speed (anchor-normalised units / frame).
+    confirm_frames : int
+        Consecutive frames needed to confirm a state transition.
     history_len : int
-        Number of past frames used for velocity smoothing (moving average).
+        Number of past frames used for velocity smoothing.
+    pos_diff_thr : float
+        Minimum wrist displacement (in shoulder-widths) between transitions.
+    pos_lookback : int
+        When recording the transition position, look back this many frames
+        instead of using the current frame.  This avoids the "late snapshot"
+        problem where the position is already at the new pose.
+    bbox_vel_thr : float
+        Maximum tolerated bbox centre speed (pixels / frame, averaged over
+        recent frames).  Above this the frame is labelled "bbox_change".
+    bbox_history_len : int
+        Number of recent bbox centres kept for bbox velocity computation.
     """
 
     # Action labels
@@ -98,44 +106,44 @@ class PointingActionDetector:
     RAISING = "raising"
     POINTING = "pointing"
     LOWERING = "lowering"
+    BBOX_CHANGE = "bbox_change"
+    NO_BBOX = "no_bbox"
 
     def __init__(
         self,
-        ratio_thr: float = 4.0,
+        ratio_thr: float = 2.8,
         vel_min: float = 0.025,
         confirm_frames: int = 3,
         history_len: int = 3,
-        pos_diff_thr: float = 0.1,
+        pos_diff_thr: float = 0.05,
+        pos_lookback: int = 3,
+        bbox_vel_thr: float = 8.0,
+        bbox_history_len: int = 3,
     ):
         self.ratio_thr = ratio_thr
-        self.vel_min = vel_min  # min wrist speed for either hand
+        self.vel_min = vel_min
         self.confirm_frames = confirm_frames
         self.history_len = history_len
-        self.pos_diff_thr = pos_diff_thr  # min position change between transitions
+        self.pos_diff_thr = pos_diff_thr
+        self.pos_lookback = pos_lookback
+        self.bbox_vel_thr = bbox_vel_thr
+        self.bbox_history_len = bbox_history_len
 
         # State
         self.state = self.IDLE
         self._confirm_count = 0
         self._prev_rel_positions = []    # list of (left_wrist_rel, right_wrist_rel)
         self._last_transition_pos = None  # (lw_rel, rw_rel) snapshot at last transition
+        self._active_side = None          # "left" or "right" or None
+
+        # Bbox stability tracking – stores recent bbox centres (np.ndarray (2,))
+        self._bbox_centres = []  # list of np.ndarray (2,) or None
+        self._bbox_confirm_count = 0  # consecutive frames with bbox_vel >= thr
+        self._bbox_stable_count = 0   # consecutive frames with bbox_vel < thr (while in BBOX_CHANGE)
 
     # ------------------------------------------------------------------
     def _compute_anchor_and_rel(self, kpts, scores, kpt_thr=0.3):
-        """Compute anchor (mid-shoulder) and relative wrist positions.
-
-        Parameters
-        ----------
-        kpts : np.ndarray (48, 2)  – filtered arm keypoints for one person.
-        scores : np.ndarray (48,)
-        kpt_thr : float
-
-        Returns
-        -------
-        anchor : np.ndarray (2,)
-        left_wrist_rel : np.ndarray (2,) or None
-        right_wrist_rel : np.ndarray (2,) or None
-        anchor_scale : float  – inter-shoulder distance, used for normalisation.
-        """
+        """Compute anchor (mid-shoulder) and relative wrist positions."""
         ls = kpts[_LEFT_SHOULDER_IDX]
         rs = kpts[_RIGHT_SHOULDER_IDX]
         ls_ok = scores[_LEFT_SHOULDER_IDX] >= kpt_thr
@@ -145,7 +153,7 @@ class PointingActionDetector:
             return None, None, None, 0.0
 
         anchor = (ls + rs) / 2.0
-        anchor_scale = max(np.linalg.norm(ls - rs), 1e-6)  # avoid div-by-zero
+        anchor_scale = max(np.linalg.norm(ls - rs), 1e-6)
 
         lw = kpts[_LEFT_WRIST_IDX]
         rw = kpts[_RIGHT_WRIST_IDX]
@@ -159,25 +167,13 @@ class PointingActionDetector:
 
     # ------------------------------------------------------------------
     def _velocity(self, current, history_key):
-        """Compute smoothed velocity from recent history.
-
-        Parameters
-        ----------
-        current : np.ndarray (2,) or None
-        history_key : str  – "left" or "right"
-
-        Returns
-        -------
-        speed : float  (scalar >= 0)
-        """
+        """Compute smoothed velocity from recent history."""
         if current is None or len(self._prev_rel_positions) == 0:
             return 0.0
 
-        # Collect valid previous positions
         vels = []
         for i in range(1, min(self.history_len + 1, len(self._prev_rel_positions) + 1)):
-            idx = -(i)
-            prev = self._prev_rel_positions[idx]
+            prev = self._prev_rel_positions[-(i)]
             prev_pos = prev[0] if history_key == "left" else prev[1]
             if prev_pos is not None:
                 vels.append(np.linalg.norm(current - prev_pos) / i)
@@ -189,34 +185,105 @@ class PointingActionDetector:
     def _vel_ratio(vel_left, vel_right):
         """Compute the ratio of the faster wrist to the slower wrist.
         Returns (ratio, faster_side).  ratio >= 1.0 always."""
-        min_vel = 1e-9  # avoid division by zero
+        min_vel = 1e-9
         if vel_left >= vel_right:
             return vel_left / max(vel_right, min_vel), "left"
         else:
             return vel_right / max(vel_left, min_vel), "right"
 
     # ------------------------------------------------------------------
-    def update(self, kpts, scores, kpt_thr=0.3):
-        """Process one frame and return the action label.
+    def _bbox_velocity(self, bbox):
+        """Compute average bbox centre speed over recent frames.
 
-        The transition criterion requires **all** of the following to hold
-        for ``confirm_frames`` (default 3) consecutive frames:
-          1. vel_ratio >= ratio_thr  (one wrist moves much faster than the other)
-          2. max(vel_left, vel_right) >= vel_min  (at least one wrist is actually moving)
+        Parameters
+        ----------
+        bbox : np.ndarray (4,)  – [x1, y1, x2, y2] or None
 
-        State machine:
-          idle     → raising   : asymmetric for 3 frames
-          raising  → pointing  : symmetric  for 3 frames
-          pointing → lowering  : asymmetric for 3 frames
-          lowering → idle      : symmetric  for 3 frames
+        Returns
+        -------
+        bbox_vel : float  – average pixel displacement per frame.
         """
+        if bbox is not None:
+            centre = np.array([(bbox[0] + bbox[2]) / 2.0,
+                               (bbox[1] + bbox[3]) / 2.0])
+        else:
+            centre = None
+
+        self._bbox_centres.append(centre)
+        if len(self._bbox_centres) > self.bbox_history_len + 2:
+            self._bbox_centres.pop(0)
+
+        if centre is None or len(self._bbox_centres) < 2:
+            return 0.0
+
+        vels = []
+        for i in range(1, min(self.bbox_history_len + 1, len(self._bbox_centres))):
+            prev = self._bbox_centres[-(i + 1)]
+            if prev is not None:
+                vels.append(np.linalg.norm(centre - prev) / i)
+
+        return float(np.mean(vels)) if vels else 0.0
+
+    # ------------------------------------------------------------------
+    def _get_lookback_pos(self):
+        """Return wrist relative positions from ``pos_lookback`` frames ago.
+
+        If not enough history, return the earliest available frame.
+        Returns (lw_rel, rw_rel) – either may be None.
+        """
+        lb = min(self.pos_lookback, len(self._prev_rel_positions))
+        if lb == 0:
+            return None, None
+        return self._prev_rel_positions[-lb]
+
+    # ------------------------------------------------------------------
+    def update(self, kpts, scores, bbox=None, kpt_thr=0.3):
+        """Process one frame and return (action_label, debug_dict).
+
+        Parameters
+        ----------
+        kpts : np.ndarray (48, 2)
+        scores : np.ndarray (48,)
+        bbox : np.ndarray (4,) or None  – person bbox [x1, y1, x2, y2].
+        kpt_thr : float
+
+        Returns
+        -------
+        state : str
+        debug : dict
+        """
+        # --- No bbox → skip detection entirely ---
+        if bbox is None:
+            self._prev_rel_positions.append((None, None))
+            self._bbox_centres.append(None)
+            if len(self._bbox_centres) > self.bbox_history_len + 2:
+                self._bbox_centres.pop(0)
+            # Reset state machine so next valid frame starts from IDLE
+            self.state = self.IDLE
+            self._confirm_count = 0
+            self._active_side = None
+            self._last_transition_pos = None
+            return self.NO_BBOX, {
+                "reason": "no_bbox",
+                "bbox_vel": 0.0,
+                "active_side": self._active_side,
+            }
+
+        # --- Bbox stability check (with consecutive-frame confirmation) ---
+        bbox_vel = self._bbox_velocity(bbox)
+        bbox_over_thr = bbox_vel >= self.bbox_vel_thr
+
         anchor, lw_rel, rw_rel, anchor_scale = self._compute_anchor_and_rel(
             kpts, scores, kpt_thr
         )
 
         if anchor is None:
             self._prev_rel_positions.append((None, None))
-            return self.state, {"reason": "shoulders_not_visible"}
+            return self.state, {
+                "reason": "shoulders_not_visible",
+                "bbox_vel": round(bbox_vel, 3),
+                "active_side": self._active_side,
+            }
 
         vel_left = self._velocity(lw_rel, "left")
         vel_right = self._velocity(rw_rel, "right")
@@ -229,16 +296,74 @@ class PointingActionDetector:
             "faster_side": faster_side,
             "anchor_scale": round(anchor_scale, 2),
             "state_before": self.state,
+            "bbox_vel": round(bbox_vel, 3),
+            "active_side": self._active_side,
         }
 
-        # Determine whether the current frame satisfies "asymmetric" condition:
-        # ratio must exceed threshold AND at least one wrist must be moving fast enough
+        # --- Bbox change state machine (needs confirm_frames consecutive frames) ---
+        if self.state == self.BBOX_CHANGE:
+            # Already in BBOX_CHANGE: wait for confirm_frames consecutive stable frames
+            if not bbox_over_thr:
+                self._bbox_stable_count += 1
+                self._bbox_confirm_count = 0
+                if self._bbox_stable_count >= self.confirm_frames:
+                    # Transition back to IDLE
+                    self.state = self.IDLE
+                    self._bbox_stable_count = 0
+                    self._confirm_count = 0
+                    self._active_side = None
+                    self._last_transition_pos = None
+            else:
+                self._bbox_stable_count = 0
+                self._bbox_confirm_count = 0
+
+            # While in BBOX_CHANGE, skip normal action detection
+            debug["state_after"] = self.state if self.state != self.IDLE else self.IDLE
+            debug["bbox_unstable"] = True
+
+            self._prev_rel_positions.append((lw_rel, rw_rel))
+            if len(self._prev_rel_positions) > self.history_len + 2:
+                self._prev_rel_positions.pop(0)
+
+            # If we just transitioned back to IDLE, report IDLE; otherwise BBOX_CHANGE
+            if self.state == self.IDLE:
+                debug["state_after"] = self.IDLE
+                return self.IDLE, debug
+            else:
+                debug["state_after"] = self.BBOX_CHANGE
+                return self.BBOX_CHANGE, debug
+        else:
+            # Not in BBOX_CHANGE yet: count consecutive over-threshold frames
+            if bbox_over_thr:
+                self._bbox_confirm_count += 1
+                self._bbox_stable_count = 0
+                if self._bbox_confirm_count >= self.confirm_frames:
+                    # Enter BBOX_CHANGE state
+                    self.state = self.IDLE  # internal state reset
+                    self._confirm_count = 0
+                    self._active_side = None
+                    self._last_transition_pos = None
+                    self._bbox_confirm_count = 0
+
+                    debug["state_after"] = self.BBOX_CHANGE
+                    debug["bbox_unstable"] = True
+
+                    self._prev_rel_positions.append((lw_rel, rw_rel))
+                    if len(self._prev_rel_positions) > self.history_len + 2:
+                        self._prev_rel_positions.pop(0)
+
+                    # Mark state as BBOX_CHANGE for next frame's check
+                    self.state = self.BBOX_CHANGE
+                    return self.BBOX_CHANGE, debug
+            else:
+                self._bbox_confirm_count = 0
+                self._bbox_stable_count = 0
+
+        # Determine asymmetric / symmetric conditions
         is_asymmetric = (
             ratio >= self.ratio_thr
             and max(vel_left, vel_right) >= self.vel_min
         )
-
-        # Symmetric = both conditions are NOT met (hands truly stable)
         is_symmetric = (
             ratio < self.ratio_thr
             and max(vel_left, vel_right) < self.vel_min
@@ -248,9 +373,7 @@ class PointingActionDetector:
         cur_pos = (lw_rel, rw_rel)
 
         def _pos_changed_enough():
-            """Check if wrists moved enough since the last recorded transition.
-            Compares both wrists; if either moved more than pos_diff_thr,
-            we consider it a genuine motion.  Returns (ok, dist)."""
+            """Check if wrists moved enough since the last recorded transition."""
             if self._last_transition_pos is None:
                 return True, float("inf")
             dists = []
@@ -263,36 +386,36 @@ class PointingActionDetector:
             return max_dist >= self.pos_diff_thr, max_dist
 
         def _try_transition(new_state):
-            """Attempt a state transition.  If the position hasn't changed
-            enough since last transition, reject it and reset to IDLE."""
+            """Attempt a state transition.  Use lookback position for snapshot."""
             ok, dist = _pos_changed_enough()
             debug["pos_diff"] = round(dist, 4) if dist != float("inf") else None
             if ok:
                 self.state = new_state
+                # Use position from ``pos_lookback`` frames ago instead of current
+                lb_lw, lb_rw = self._get_lookback_pos()
                 self._last_transition_pos = (
-                    lw_rel.copy() if lw_rel is not None else None,
-                    rw_rel.copy() if rw_rel is not None else None,
+                    lb_lw.copy() if lb_lw is not None else None,
+                    lb_rw.copy() if lb_rw is not None else None,
                 )
                 debug["pos_check"] = "pass"
             else:
-                # Position barely changed → spurious trigger, reset to idle
                 self.state = self.IDLE
                 self._last_transition_pos = None
+                self._active_side = None
                 debug["pos_check"] = f"fail(dist={dist:.4f}<{self.pos_diff_thr})"
             self._confirm_count = 0
 
         # --- State transitions ---
         if self.state == self.IDLE:
-            # idle → raising: asymmetric for confirm_frames
             if is_asymmetric:
                 self._confirm_count += 1
                 if self._confirm_count >= self.confirm_frames:
+                    self._active_side = faster_side
                     _try_transition(self.RAISING)
             else:
                 self._confirm_count = 0
 
         elif self.state == self.RAISING:
-            # raising → pointing: symmetric for confirm_frames
             if is_symmetric:
                 self._confirm_count += 1
                 if self._confirm_count >= self.confirm_frames:
@@ -301,7 +424,6 @@ class PointingActionDetector:
                 self._confirm_count = 0
 
         elif self.state == self.POINTING:
-            # pointing → lowering: asymmetric again for confirm_frames
             if is_asymmetric:
                 self._confirm_count += 1
                 if self._confirm_count >= self.confirm_frames:
@@ -310,15 +432,16 @@ class PointingActionDetector:
                 self._confirm_count = 0
 
         elif self.state == self.LOWERING:
-            # lowering → idle: symmetric for confirm_frames
             if is_symmetric:
                 self._confirm_count += 1
                 if self._confirm_count >= self.confirm_frames:
+                    self._active_side = None
                     _try_transition(self.IDLE)
             else:
                 self._confirm_count = 0
 
         debug["state_after"] = self.state
+        debug["active_side"] = self._active_side
 
         # Update history (keep bounded)
         self._prev_rel_positions.append((lw_rel, rw_rel))
@@ -580,16 +703,20 @@ def main():
 
     # Action label → display color (BGR for cv2)
     ACTION_COLORS = {
-        PointingActionDetector.IDLE:     (200, 200, 200),  # grey
-        PointingActionDetector.RAISING:  (0, 200, 255),    # orange
-        PointingActionDetector.POINTING: (0, 255, 0),      # green
-        PointingActionDetector.LOWERING: (0, 0, 255),      # red
+        PointingActionDetector.IDLE:        (200, 200, 200),  # grey
+        PointingActionDetector.RAISING:     (0, 200, 255),    # orange
+        PointingActionDetector.POINTING:    (0, 255, 0),      # green
+        PointingActionDetector.LOWERING:    (0, 0, 255),      # red
+        PointingActionDetector.BBOX_CHANGE: (255, 0, 255),    # magenta
+        PointingActionDetector.NO_BBOX:     (128, 128, 128),  # dark grey
     }
     ACTION_LABELS_CN = {
-        PointingActionDetector.IDLE:     "idle",
-        PointingActionDetector.RAISING:  "raising",
-        PointingActionDetector.POINTING: "pointing",
-        PointingActionDetector.LOWERING: "lowering",
+        PointingActionDetector.IDLE:        "idle",
+        PointingActionDetector.RAISING:     "raising",
+        PointingActionDetector.POINTING:    "pointing",
+        PointingActionDetector.LOWERING:    "lowering",
+        PointingActionDetector.BBOX_CHANGE: "bbox_change",
+        PointingActionDetector.NO_BBOX:     "no_bbox",
     }
 
     for image_name in tqdm(image_names, total=len(image_names)):
@@ -599,9 +726,13 @@ def main():
         if use_track:
             fidx = _frame_index_from_name(image_name)
             bboxes = frame_bboxes.get(fidx, np.empty((0, 4), dtype=np.float32))
-            keypoints, keypoint_scores, bboxes = process_one_image_with_bbox(
-                image, bboxes, model
-            )
+            if len(bboxes) == 0:
+                # Frame has no annotation in track.json → skip pose estimation
+                keypoints, keypoint_scores = [], []
+            else:
+                keypoints, keypoint_scores, bboxes = process_one_image_with_bbox(
+                    image, bboxes, model
+                )
         else:
             keypoints, keypoint_scores, bboxes = process_one_image(
                 args, image, detector, model
@@ -615,11 +746,19 @@ def main():
         # --- Pointing action detection (use first detected person) ---
         action_label = PointingActionDetector.IDLE
         action_debug = {}
+        person_bbox = bboxes[0] if len(bboxes) > 0 else None
         if len(keypoints) > 0:
             kpts_arr = np.asarray(keypoints[0])
             scores_arr = np.asarray(keypoint_scores[0])
             action_label, action_debug = action_detector.update(
-                kpts_arr, scores_arr, kpt_thr=args.kpt_thr
+                kpts_arr, scores_arr, bbox=person_bbox, kpt_thr=args.kpt_thr
+            )
+        else:
+            # No person detected → pass dummy kpts with bbox=None to trigger NO_BBOX
+            dummy_kpts = np.zeros((len(ARM_INDICES), 2), dtype=np.float32)
+            dummy_scores = np.zeros(len(ARM_INDICES), dtype=np.float32)
+            action_label, action_debug = action_detector.update(
+                dummy_kpts, dummy_scores, bbox=None, kpt_thr=args.kpt_thr
             )
 
         # Collect per-frame metrics
@@ -630,6 +769,8 @@ def main():
             "vel_right": action_debug.get("vel_right", 0.0),
             "state": action_label,
             "pos_diff": action_debug.get("pos_diff", None),
+            "bbox_vel": action_debug.get("bbox_vel", 0.0),
+            "active_side": action_debug.get("active_side", None),
         })
 
         # Filter skeleton and colors for arm keypoints
@@ -657,21 +798,25 @@ def main():
             vis_image = cv2.cvtColor(vis_image_rgb, cv2.COLOR_RGB2BGR)
 
             # --- Draw action label on the image ---
-            label_text = f"Action: {ACTION_LABELS_CN[action_label]}"
-            label_color = ACTION_COLORS[action_label]
+            side_str = action_debug.get("active_side") or ""
+            side_suffix = f" [{side_str}]" if side_str else ""
+            label_text = f"Action: {ACTION_LABELS_CN.get(action_label, action_label)}{side_suffix}"
+            label_color = ACTION_COLORS.get(action_label, (200, 200, 200))
             vel_text = (
                 f"vL={action_debug.get('vel_left', 0):.4f}  "
                 f"vR={action_debug.get('vel_right', 0):.4f}  "
                 f"ratio={action_debug.get('vel_ratio', 0):.2f}"
             )
+            bbox_vel_val = action_debug.get("bbox_vel", 0.0)
+            bbox_text = f"bbox_vel={bbox_vel_val:.3f}"
             pos_diff_val = action_debug.get('pos_diff', None)
             pos_text = (
                 f"pos_diff={pos_diff_val:.4f}  {action_debug.get('pos_check', '')}"
                 if pos_diff_val is not None else ""
             )
             # Background rectangle for readability
-            hud_h = 90 if pos_text else 75
-            cv2.rectangle(vis_image, (10, 10), (520, hud_h), (0, 0, 0), -1)
+            hud_h = 110 if pos_text else 95
+            cv2.rectangle(vis_image, (10, 10), (560, hud_h), (0, 0, 0), -1)
             cv2.putText(
                 vis_image, label_text, (20, 40),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, label_color, 2, cv2.LINE_AA,
@@ -680,9 +825,13 @@ def main():
                 vis_image, vel_text, (20, 65),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1, cv2.LINE_AA,
             )
+            cv2.putText(
+                vis_image, bbox_text, (20, 85),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 100), 1, cv2.LINE_AA,
+            )
             if pos_text:
                 cv2.putText(
-                    vis_image, pos_text, (20, 85),
+                    vis_image, pos_text, (20, 105),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 200, 255), 1, cv2.LINE_AA,
                 )
 
@@ -701,6 +850,7 @@ def main():
                 frames_records.append({
                     "image_name": image_name,
                     "action": action_label,
+                    "active_side": action_debug.get("active_side", None),
                     "action_debug": {
                         k: v for k, v in action_debug.items()
                         if isinstance(v, (int, float, str, type(None)))
@@ -737,6 +887,7 @@ def main():
         plot_action_metrics(
             action_metrics, plot_path,
             ratio_thr=action_detector.ratio_thr,
+            bbox_vel_thr=action_detector.bbox_vel_thr,
             title=video_label,
         )
         print(f"[vis_pose] wrote metrics plot: {plot_path}")
