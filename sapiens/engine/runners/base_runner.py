@@ -33,7 +33,7 @@ from sapiens.registry import (
     VISUALIZERS,
 )
 from torch import nn
-from torch.distributed.fsdp import MixedPrecisionPolicy
+from torch.distributed._composable.fsdp import MixedPrecisionPolicy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader
 

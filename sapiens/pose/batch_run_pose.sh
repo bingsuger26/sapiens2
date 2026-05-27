@@ -3,18 +3,25 @@
 # batch_run_pose.sh
 # Batch-process all pointing video clips through the Sapiens2 pose pipeline.
 #
-# Usage:
-#   bash batch_run_pose.sh              # process ALL datasets
-#   bash batch_run_pose.sh dataset_xxx  # process one specific dataset
+# Multi-GPU + per-GPU multi-batch parallel.
+#   - Total parallel workers = NUM_GPUS * PER_GPU_JOBS
+#   - Each clip is dispatched to one worker; the worker pins itself to one
+#     specific GPU via CUDA_VISIBLE_DEVICES.
 #
-# Outputs mirror the source tree under /home/sanmeng/output/
+# Usage:
+#   bash batch_run_pose.sh                            # all datasets, auto-detect GPUs
+#   bash batch_run_pose.sh dataset_xxx                # one specific dataset
+#   NUM_GPUS=4 PER_GPU_JOBS=2 bash batch_run_pose.sh  # override (4 GPUs, 2 jobs/GPU = 8 workers)
+#   PER_GPU_JOBS=2 bash batch_run_pose.sh             # 1 GPU, 2 concurrent clips on it
+#
+# Outputs mirror the source tree under ${OUTPUT_ROOT}.
 # ===========================================================================
 
 set -euo pipefail
 
 # ---- Paths ----------------------------------------------------------------
-DATA_ROOT="/home/sanmeng/models/sapiens2/sapiens/pose/outputs/resized_img"
-OUTPUT_ROOT="/home/sanmeng/outputs/results"
+DATA_ROOT="/home/sanmeng/data/pointing_resized"
+OUTPUT_ROOT="/home/sanmeng/data/pointing_resized/output"
 POSE_DIR="/home/sanmeng/models/sapiens2/sapiens/pose"
 PYTHON="/home/sanmeng/envs/sapiens2/bin/python"
 
@@ -28,33 +35,42 @@ POSE_CKPT="/home/sanmeng/models/sapiens2/sapiens2_host/sapiens2_0.4b_pose.safete
 RADIUS=8
 KPT_THR=0.3
 THICKNESS=8
-DEVICE="cuda:0"
+
+# ---- Parallelism config ---------------------------------------------------
+# Auto-detect GPU count if NUM_GPUS not provided.
+if [[ -z "${NUM_GPUS:-}" ]]; then
+    if command -v nvidia-smi &>/dev/null; then
+        NUM_GPUS=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l)
+    else
+        NUM_GPUS=1
+    fi
+fi
+NUM_GPUS=${NUM_GPUS:-1}
+[[ "${NUM_GPUS}" -lt 1 ]] && NUM_GPUS=1
+
+PER_GPU_JOBS="${PER_GPU_JOBS:-1}"          # concurrent clips per GPU
+TOTAL_WORKERS=$((NUM_GPUS * PER_GPU_JOBS))
 
 # ---- Optional: single dataset filter --------------------------------------
 FILTER_DATASET="${1:-}"
 
-# ---- Counters --------------------------------------------------------------
-TOTAL=0
-DONE=0
-SKIP=0
-FAIL=0
-
 # ---- Discover all video/color dirs ----------------------------------------
 echo "=========================================="
 echo " Scanning ${DATA_ROOT} ..."
+echo " GPUs           : ${NUM_GPUS}"
+echo " Jobs per GPU   : ${PER_GPU_JOBS}"
+echo " Total workers  : ${TOTAL_WORKERS}"
+[[ -n "${FILTER_DATASET}" ]] && echo " Filter dataset : ${FILTER_DATASET}"
 echo "=========================================="
 
-# Build task list: each line is   <input_dir> <output_dir>
+# Build task list: each line is   <input_dir>\t<output_dir>
 TASK_LIST=$(mktemp)
+trap 'rm -f "${TASK_LIST}" "${STATS_DIR:-/dev/null}"/* 2>/dev/null; rmdir "${STATS_DIR:-/dev/null}" 2>/dev/null || true' EXIT
 
+# NOTE: piping `find | while` runs the loop in a subshell; `>>` to a real file
+# is fine. We use a TAB separator so paths with spaces stay intact.
 find "${DATA_ROOT}" -path "*/video/color" -type d | sort | while read -r color_dir; do
-    # Example color_dir:
-    #   /home/data/hmi/slices/pointing/dataset_xxx/person_uuid/0000001/video/color
-
-    # Extract relative path after DATA_ROOT
-    rel="${color_dir#${DATA_ROOT}/}"              # dataset_xxx/uuid/0000001/video/color
-
-    # Extract dataset name (first component)
+    rel="${color_dir#${DATA_ROOT}/}"          # dataset_xxx/uuid/0000001/video/color
     dataset_name="${rel%%/*}"
 
     # Apply optional filter
@@ -62,17 +78,18 @@ find "${DATA_ROOT}" -path "*/video/color" -type d | sort | while read -r color_d
         continue
     fi
 
-    # Skip non-dataset dirs (annotations, etc.)
+    # Skip non-dataset dirs (annotations, output, etc.)
     if [[ ! "${dataset_name}" =~ ^dataset_ ]]; then
         continue
     fi
 
-    # Build output path: keep structure but strip "video/color" suffix
-    # e.g. dataset_xxx/uuid/0000001/video/color  ->  dataset_xxx/uuid/0000001
+    # Skip the output tree if it lives under DATA_ROOT
+    case "${rel}" in output/*) continue ;; esac
+
     segment_rel="${rel%/video/color}"
     out_dir="${OUTPUT_ROOT}/${segment_rel}"
 
-    echo "${color_dir} ${out_dir}" >> "${TASK_LIST}"
+    printf '%s\t%s\n' "${color_dir}" "${out_dir}" >> "${TASK_LIST}"
 done
 
 TOTAL=$(wc -l < "${TASK_LIST}")
@@ -81,29 +98,37 @@ echo ""
 
 if [[ "${TOTAL}" -eq 0 ]]; then
     echo "Nothing to do."
-    rm -f "${TASK_LIST}"
     exit 0
 fi
 
-# ---- Process ---------------------------------------------------------------
-IDX=0
-while read -r color_dir out_dir; do
-    IDX=$((IDX + 1))
+# ---- Stats dir (one file per outcome, atomic & lock-free) -----------------
+STATS_DIR=$(mktemp -d)
 
-    # Check if already processed (output dir exists and has images)
-    if [[ -d "${out_dir}" ]] && ls "${out_dir}"/*.png &>/dev/null; then
-        SKIP=$((SKIP + 1))
-        echo "[${IDX}/${TOTAL}] SKIP (already done): ${out_dir}"
-        continue
+# ---- Worker function (invoked by xargs in subshells) ----------------------
+run_one() {
+    # Args: <slot_idx> <task_idx> <total> <color_dir> <out_dir>
+    local slot_idx="$1"
+    local task_idx="$2"
+    local total="$3"
+    local color_dir="$4"
+    local out_dir="$5"
+
+    local gpu_id=$(( slot_idx % NUM_GPUS ))
+
+    # Skip if already done (output dir exists and has png files)
+    if [[ -d "${out_dir}" ]] && compgen -G "${out_dir}/*.png" >/dev/null; then
+        echo "[${task_idx}/${total}] [GPU${gpu_id}] SKIP (already done): ${out_dir}"
+        : > "${STATS_DIR}/skip.${task_idx}"
+        return 0
     fi
 
-    echo "[${IDX}/${TOTAL}] Processing: ${color_dir}"
-    echo "            Output:     ${out_dir}"
-
+    echo "[${task_idx}/${total}] [GPU${gpu_id}] RUN : ${color_dir}"
     mkdir -p "${out_dir}"
 
+    # Run inference. Pin to a single GPU; from the process's perspective it
+    # only sees one card, so we pass --device cuda:0 inside.
     if cd "${POSE_DIR}" && \
-       CUDA_VISIBLE_DEVICES=0 "${PYTHON}" tools/vis/vis_pose.py \
+       CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON}" tools/vis/vis_pose.py \
            "${DET_CONFIG}" \
            "${DET_CKPT}" \
            "${POSE_CONFIG}" \
@@ -113,26 +138,45 @@ while read -r color_dir out_dir; do
            --radius "${RADIUS}" \
            --kpt-thr "${KPT_THR}" \
            --thickness "${THICKNESS}" \
-           --device "${DEVICE}" \
-       2>&1 | tail -3; then
-        DONE=$((DONE + 1))
-        echo "            -> OK"
+           --device "cuda:0" \
+       >"${out_dir}/.pose.log" 2>&1; then
+        echo "[${task_idx}/${total}] [GPU${gpu_id}] OK  : ${out_dir}"
+        : > "${STATS_DIR}/done.${task_idx}"
     else
-        FAIL=$((FAIL + 1))
-        echo "            -> FAILED"
+        echo "[${task_idx}/${total}] [GPU${gpu_id}] FAIL: ${out_dir} (see ${out_dir}/.pose.log)"
+        : > "${STATS_DIR}/fail.${task_idx}"
     fi
+}
+export -f run_one
+export POSE_DIR PYTHON DET_CONFIG DET_CKPT POSE_CONFIG POSE_CKPT \
+       RADIUS KPT_THR THICKNESS NUM_GPUS STATS_DIR
 
-    echo ""
-done < "${TASK_LIST}"
+# ---- Dispatch via xargs ---------------------------------------------------
+# Each input line:  <slot_idx>\t<task_idx>\t<total>\t<color_dir>\t<out_dir>
+# `xargs -P TOTAL_WORKERS -n 1 -I {}` keeps strict per-line dispatch and
+# round-robins via slot_idx = (task_idx-1) % TOTAL_WORKERS.
+awk -v W="${TOTAL_WORKERS}" -v T="${TOTAL}" 'BEGIN{FS="\t"; OFS="\t"} {
+    slot = (NR - 1) % W
+    print slot, NR, T, $1, $2
+}' "${TASK_LIST}" | \
+    xargs -d '\n' -P "${TOTAL_WORKERS}" -I {} \
+        bash -c 'IFS=$'"'"'\t'"'"' read -r slot idx total cdir odir <<<"$1"; run_one "$slot" "$idx" "$total" "$cdir" "$odir"' _ {}
 
-rm -f "${TASK_LIST}"
+# ---- Summary --------------------------------------------------------------
+DONE=$(ls "${STATS_DIR}"/done.* 2>/dev/null | wc -l)
+SKIP=$(ls "${STATS_DIR}"/skip.* 2>/dev/null | wc -l)
+FAIL=$(ls "${STATS_DIR}"/fail.* 2>/dev/null | wc -l)
 
-# ---- Summary ---------------------------------------------------------------
+echo ""
 echo "=========================================="
 echo " BATCH COMPLETE"
 echo "=========================================="
-echo " Total clips : ${TOTAL}"
-echo " Processed   : ${DONE}"
-echo " Skipped     : ${SKIP}"
-echo " Failed      : ${FAIL}"
+echo " Total clips    : ${TOTAL}"
+echo " Processed (OK) : ${DONE}"
+echo " Skipped        : ${SKIP}"
+echo " Failed         : ${FAIL}"
+echo " GPUs used      : ${NUM_GPUS} x ${PER_GPU_JOBS} = ${TOTAL_WORKERS} workers"
 echo "=========================================="
+
+# Non-zero exit if any failed
+[[ "${FAIL}" -gt 0 ]] && exit 1 || exit 0

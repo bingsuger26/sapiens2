@@ -14,6 +14,7 @@ Output layout (mirrors source):
 Usage:
     python resize_images.py
     python resize_images.py --dataset dataset_20260323101357_f58270ae
+    python resize_images.py --dataset dataset_a dataset_b dataset_c
     python resize_images.py --width 768 --height 512
     python resize_images.py --workers 8
 """
@@ -35,6 +36,11 @@ OUTPUT_ROOT = "/home/sanmeng/data/pointing_resized"
 def discover_segments(data_root, filter_dataset=None):
     """Discover all segments that have track.json annotations.
 
+    `filter_dataset` may be:
+        - None       : process every dataset under data_root
+        - str        : process a single dataset
+        - list/tuple : process the given datasets (order preserved, dedup)
+
     Each returned dict:
         dataset   : dataset_xxx
         uuid      : uuid string
@@ -44,7 +50,16 @@ def discover_segments(data_root, filter_dataset=None):
     """
     # Step 1: collect dataset dirs (filter early)
     if filter_dataset:
-        candidates = [filter_dataset]
+        if isinstance(filter_dataset, (list, tuple)):
+            # Preserve order, drop duplicates
+            seen = set()
+            candidates = []
+            for d in filter_dataset:
+                if d not in seen:
+                    seen.add(d)
+                    candidates.append(d)
+        else:
+            candidates = [filter_dataset]
     else:
         candidates = sorted(
             d for d in os.listdir(data_root)
@@ -218,8 +233,12 @@ def main():
         description="Batch-resize pointing dataset images and rescale annotations"
     )
     parser.add_argument(
-        "--dataset", default=None,
-        help="Process only this dataset (e.g. dataset_20260323101357_f58270ae)",
+        "--dataset", default=None, nargs="+",
+        help=(
+            "Process only the given dataset(s); accepts one or more dataset "
+            "names (e.g. --dataset dataset_20260323101357_f58270ae "
+            "dataset_20260325140925_4d83e35d). If omitted, process all."
+        ),
     )
     parser.add_argument("--width", type=int, default=768, help="Target width")
     parser.add_argument("--height", type=int, default=512, help="Target height")

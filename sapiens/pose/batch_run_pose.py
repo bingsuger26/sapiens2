@@ -63,7 +63,7 @@ from tools.vis.vis_pose import (
     load_track_json,
 )
 from tools.vis.pose_render_utils import visualize_keypoints
-from tools.vis.plot_metrics import plot_action_metrics
+from tools.vis.plot_metrics import plot_action_metrics, plot_summary_distribution
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +157,7 @@ def process_clip(args, input_dir, output_dir, detector, model,
         and not n.startswith("video_annotation")
     )
     if not image_names:
-        return 0
+        return 0, []
 
     # Load pre-computed bboxes if available
     frame_bboxes = None
@@ -180,7 +180,7 @@ def process_clip(args, input_dir, output_dir, detector, model,
         PointingActionDetector.RAISING:     "raising",
         PointingActionDetector.POINTING:    "pointing",
         PointingActionDetector.LOWERING:    "lowering",
-        PointingActionDetector.BBOX_CHANGE: "bbox_change",
+        PointingActionDetector.BBOX_CHANGE: "shoulder_change",
         PointingActionDetector.NO_BBOX:     "no_bbox",
     }
 
@@ -266,6 +266,26 @@ def process_clip(args, input_dir, output_dir, detector, model,
             )
             vis_image = cv2.cvtColor(vis_image_rgb, cv2.COLOR_RGB2BGR)
 
+            # --- Draw shoulder midpoint (cyan diamond) ---
+            shoulder_mid = action_debug.get("shoulder_mid")
+            if shoulder_mid is not None:
+                sm = (int(round(shoulder_mid[0])), int(round(shoulder_mid[1])))
+                cv2.drawMarker(vis_image, sm, (255, 255, 0), cv2.MARKER_DIAMOND, 16, 2)
+
+            # --- Draw hand mean points (left=green circle, right=blue circle) ---
+            lh_mean = action_debug.get("left_hand_mean")
+            rh_mean = action_debug.get("right_hand_mean")
+            if lh_mean is not None:
+                lhp = (int(round(lh_mean[0])), int(round(lh_mean[1])))
+                cv2.circle(vis_image, lhp, 12, (0, 255, 0), 3)
+                cv2.putText(vis_image, "LH", (lhp[0] + 14, lhp[1] + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+            if rh_mean is not None:
+                rhp = (int(round(rh_mean[0])), int(round(rh_mean[1])))
+                cv2.circle(vis_image, rhp, 12, (255, 100, 0), 3)
+                cv2.putText(vis_image, "RH", (rhp[0] + 14, rhp[1] + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 100, 0), 1, cv2.LINE_AA)
+
             # HUD
             side_str = action_debug.get("active_side") or ""
             side_suffix = f" [{side_str}]" if side_str else ""
@@ -276,8 +296,8 @@ def process_clip(args, input_dir, output_dir, detector, model,
                 f"vR={action_debug.get('vel_right', 0):.4f}  "
                 f"ratio={action_debug.get('vel_ratio', 0):.2f}"
             )
-            bbox_vel_val = action_debug.get("bbox_vel", 0.0)
-            bbox_text = f"bbox_vel={bbox_vel_val:.3f}"
+            shoulder_vel_val = action_debug.get("shoulder_vel", 0.0)
+            shoulder_text = f"shoulder_vel={shoulder_vel_val:.3f}"
             pos_diff_val = action_debug.get("pos_diff", None)
             pos_text = (
                 f"pos_diff={pos_diff_val:.4f}  {action_debug.get('pos_check', '')}"
@@ -289,8 +309,8 @@ def process_clip(args, input_dir, output_dir, detector, model,
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, label_color, 2, cv2.LINE_AA)
             cv2.putText(vis_image, vel_text, (20, 65),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
-            cv2.putText(vis_image, bbox_text, (20, 85),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 100), 1, cv2.LINE_AA)
+            cv2.putText(vis_image, shoulder_text, (20, 85),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 100), 1, cv2.LINE_AA)
             if pos_text:
                 cv2.putText(vis_image, pos_text, (20, 105),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 200, 255), 1, cv2.LINE_AA)
@@ -312,7 +332,7 @@ def process_clip(args, input_dir, output_dir, detector, model,
                 "active_side": action_debug.get("active_side", None),
                 "action_debug": {
                     k: v for k, v in action_debug.items()
-                    if isinstance(v, (int, float, str, type(None)))
+                    if isinstance(v, (int, float, str, list, type(None)))
                 },
                 "instances": instances,
             })
@@ -344,7 +364,7 @@ def process_clip(args, input_dir, output_dir, detector, model,
             title=segment_name,
         )
 
-    return len(image_names)
+    return len(image_names), action_metrics
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +453,7 @@ def main():
     skipped = 0
     failed = 0
     total_frames = 0
+    all_metrics = []  # aggregated metrics across all clips
 
     progress = tqdm(tasks, desc="Clips", unit="clip")
     for input_dir, output_dir, track_json in progress:
@@ -446,7 +467,7 @@ def main():
         clip_track = track_json if args.use_track else None
 
         try:
-            n_frames = process_clip(
+            n_frames, clip_metrics = process_clip(
                 args, input_dir, output_dir, detector, model,
                 arm_skeleton, arm_link_color, arm_kpt_color,
                 track_json=clip_track,
@@ -454,12 +475,26 @@ def main():
             )
             done += 1
             total_frames += n_frames
+            all_metrics.extend(clip_metrics)
         except Exception as e:
             failed += 1
             tqdm.write(f"  [FAIL] {input_dir}: {e}")
             traceback.print_exc()
 
         progress.set_postfix(done=done, skip=skipped, fail=failed, frames=total_frames)
+
+    # ------------------------------------------------------------------
+    # Generate summary distribution plot across all processed clips
+    # ------------------------------------------------------------------
+    if all_metrics:
+        summary_path = os.path.join(OUTPUT_ROOT, "summary_velocity_ratio_distribution.png")
+        plot_summary_distribution(
+            all_metrics, summary_path,
+            ratio_thr=PointingActionDetector().ratio_thr,
+            vel_min=PointingActionDetector().vel_min,
+            title=f"Batch Summary ({done} clips, {total_frames} frames)",
+        )
+        print(f" Summary plot: {summary_path}")
 
     # ------------------------------------------------------------------
     print()

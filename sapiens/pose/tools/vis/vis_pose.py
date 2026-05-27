@@ -55,7 +55,7 @@ def filter_skeleton_for_arm(skeleton_links, skeleton_link_colors):
 
 
 # ---------------------------------------------------------------------------
-# Pointing action detection via wrist velocity relative to shoulder anchor
+# Pointing action detection via hand-mean velocity relative to shoulder anchor
 # ---------------------------------------------------------------------------
 
 # Indices in the *filtered* 48-point arm keypoint array
@@ -64,41 +64,52 @@ _RIGHT_SHOULDER_IDX = ARM_INDICES.index(6)   # 1
 _RIGHT_WRIST_IDX = ARM_INDICES.index(41)     # 24
 _LEFT_WRIST_IDX = ARM_INDICES.index(62)      # 45
 
+# Hand-related keypoint indices in the *filtered* array.
+# Right hand: from right wrist (filtered idx 24) to midpoint of filtered range
+# Left hand: from midpoint to left wrist region (filtered idx 45+)
+# We define "hand-related" as everything except shoulders (0,1) and elbows (2,3),
+# split into right-side (first half: indices 4..27) and left-side (second half: 28..51)
+_RIGHT_HAND_INDICES = list(range(4, 28))   # includes right wrist + fingers
+_LEFT_HAND_INDICES = list(range(28, len(ARM_INDICES)))  # includes left wrist + fingers
+
 
 class PointingActionDetector:
     """Rule-based state machine that classifies each frame into one of:
 
         "idle"        – no pointing action detected
-        "raising"     – hand is being raised (wrist moving fast upward/outward)
+        "raising"     – hand is being raised (hand mean moving fast upward/outward)
         "pointing"    – hand is held steady in a pointing pose
         "lowering"    – hand is being lowered back
-        "bbox_change" – camera / person is moving too much, skip detection
+        "shoulder_change" – person/camera is moving too much, skip detection
 
-    The detector tracks the *primary wrist* (whichever moves first) and uses
-    velocity in an anchor-relative coordinate system.  It also reports which
-    side (left / right) is driving the action.
+    The detector tracks the *primary hand* (whichever side's hand-mean moves
+    first) and uses velocity in an anchor-relative coordinate system.  It also
+    reports which side (left / right) is driving the action.
+
+    Debounce uses the **shoulder midpoint** (mean of both shoulders) instead of
+    the bounding-box centre.  Action detection uses the **mean of all
+    hand-related keypoints** on each side instead of the single wrist point.
 
     Parameters
     ----------
     ratio_thr : float
-        Minimum ratio of faster-wrist-speed to slower-wrist-speed.
+        Minimum ratio of faster-hand-speed to slower-hand-speed.
     vel_min : float
-        Minimum wrist speed (anchor-normalised units / frame).
+        Minimum hand-mean speed (anchor-normalised units / frame).
     confirm_frames : int
         Consecutive frames needed to confirm a state transition.
     history_len : int
         Number of past frames used for velocity smoothing.
     pos_diff_thr : float
-        Minimum wrist displacement (in shoulder-widths) between transitions.
+        Minimum hand-mean displacement (in shoulder-widths) between transitions.
     pos_lookback : int
         When recording the transition position, look back this many frames
-        instead of using the current frame.  This avoids the "late snapshot"
-        problem where the position is already at the new pose.
-    bbox_vel_thr : float
-        Maximum tolerated bbox centre speed (pixels / frame, averaged over
-        recent frames).  Above this the frame is labelled "bbox_change".
-    bbox_history_len : int
-        Number of recent bbox centres kept for bbox velocity computation.
+        instead of using the current frame.
+    shoulder_vel_thr : float
+        Maximum tolerated shoulder-midpoint speed (pixels / frame, averaged
+        over recent frames).  Above this the frame is labelled "shoulder_change".
+    shoulder_history_len : int
+        Number of recent shoulder midpoints kept for velocity computation.
     """
 
     # Action labels
@@ -106,7 +117,7 @@ class PointingActionDetector:
     RAISING = "raising"
     POINTING = "pointing"
     LOWERING = "lowering"
-    BBOX_CHANGE = "bbox_change"
+    BBOX_CHANGE = "shoulder_change"
     NO_BBOX = "no_bbox"
 
     def __init__(
@@ -117,8 +128,8 @@ class PointingActionDetector:
         history_len: int = 3,
         pos_diff_thr: float = 0.05,
         pos_lookback: int = 3,
-        bbox_vel_thr: float = 8.0,
-        bbox_history_len: int = 3,
+        shoulder_vel_thr: float = 8.0,
+        shoulder_history_len: int = 3,
     ):
         self.ratio_thr = ratio_thr
         self.vel_min = vel_min
@@ -126,44 +137,57 @@ class PointingActionDetector:
         self.history_len = history_len
         self.pos_diff_thr = pos_diff_thr
         self.pos_lookback = pos_lookback
-        self.bbox_vel_thr = bbox_vel_thr
-        self.bbox_history_len = bbox_history_len
+        self.bbox_vel_thr = shoulder_vel_thr
+        self.bbox_history_len = shoulder_history_len
 
         # State
         self.state = self.IDLE
         self._confirm_count = 0
-        self._prev_rel_positions = []    # list of (left_wrist_rel, right_wrist_rel)
-        self._last_transition_pos = None  # (lw_rel, rw_rel) snapshot at last transition
+        self._prev_rel_positions = []    # list of (left_hand_mean_rel, right_hand_mean_rel)
+        self._last_transition_pos = None  # (lh_rel, rh_rel) snapshot at last transition
         self._active_side = None          # "left" or "right" or None
 
-        # Bbox stability tracking – stores recent bbox centres (np.ndarray (2,))
-        self._bbox_centres = []  # list of np.ndarray (2,) or None
-        self._bbox_confirm_count = 0  # consecutive frames with bbox_vel >= thr
-        self._bbox_stable_count = 0   # consecutive frames with bbox_vel < thr (while in BBOX_CHANGE)
+        # Shoulder midpoint stability tracking
+        self._shoulder_midpoints = []  # list of np.ndarray (2,) or None
+        self._bbox_confirm_count = 0  # consecutive frames with shoulder_vel >= thr
+        self._bbox_stable_count = 0   # consecutive frames with shoulder_vel < thr (while in BBOX_CHANGE)
 
     # ------------------------------------------------------------------
     def _compute_anchor_and_rel(self, kpts, scores, kpt_thr=0.3):
-        """Compute anchor (mid-shoulder) and relative wrist positions."""
+        """Compute anchor (mid-shoulder) and relative hand-mean positions.
+
+        Instead of single wrist points, computes the mean of all valid
+        hand-related keypoints on each side.
+        """
         ls = kpts[_LEFT_SHOULDER_IDX]
         rs = kpts[_RIGHT_SHOULDER_IDX]
         ls_ok = scores[_LEFT_SHOULDER_IDX] >= kpt_thr
         rs_ok = scores[_RIGHT_SHOULDER_IDX] >= kpt_thr
 
         if not (ls_ok and rs_ok):
-            return None, None, None, 0.0
+            return None, None, None, 0.0, None
 
         anchor = (ls + rs) / 2.0
         anchor_scale = max(np.linalg.norm(ls - rs), 1e-6)
 
-        lw = kpts[_LEFT_WRIST_IDX]
-        rw = kpts[_RIGHT_WRIST_IDX]
-        lw_ok = scores[_LEFT_WRIST_IDX] >= kpt_thr
-        rw_ok = scores[_RIGHT_WRIST_IDX] >= kpt_thr
+        # Compute left hand mean (all valid left-hand keypoints)
+        lh_pts = []
+        for idx in _LEFT_HAND_INDICES:
+            if scores[idx] >= kpt_thr:
+                lh_pts.append(kpts[idx])
+        lh_mean = np.mean(lh_pts, axis=0) if lh_pts else None
 
-        lw_rel = (lw - anchor) / anchor_scale if lw_ok else None
-        rw_rel = (rw - anchor) / anchor_scale if rw_ok else None
+        # Compute right hand mean (all valid right-hand keypoints)
+        rh_pts = []
+        for idx in _RIGHT_HAND_INDICES:
+            if scores[idx] >= kpt_thr:
+                rh_pts.append(kpts[idx])
+        rh_mean = np.mean(rh_pts, axis=0) if rh_pts else None
 
-        return anchor, lw_rel, rw_rel, anchor_scale
+        lh_rel = (lh_mean - anchor) / anchor_scale if lh_mean is not None else None
+        rh_rel = (rh_mean - anchor) / anchor_scale if rh_mean is not None else None
+
+        return anchor, lh_rel, rh_rel, anchor_scale, (lh_mean, rh_mean)
 
     # ------------------------------------------------------------------
     def _velocity(self, current, history_key):
@@ -183,7 +207,7 @@ class PointingActionDetector:
     # ------------------------------------------------------------------
     @staticmethod
     def _vel_ratio(vel_left, vel_right):
-        """Compute the ratio of the faster wrist to the slower wrist.
+        """Compute the ratio of the faster hand to the slower hand.
         Returns (ratio, faster_side).  ratio >= 1.0 always."""
         min_vel = 1e-9
         if vel_left >= vel_right:
@@ -192,44 +216,38 @@ class PointingActionDetector:
             return vel_right / max(vel_left, min_vel), "right"
 
     # ------------------------------------------------------------------
-    def _bbox_velocity(self, bbox):
-        """Compute average bbox centre speed over recent frames.
+    def _shoulder_velocity(self, shoulder_mid):
+        """Compute average shoulder midpoint speed over recent frames.
 
         Parameters
         ----------
-        bbox : np.ndarray (4,)  – [x1, y1, x2, y2] or None
+        shoulder_mid : np.ndarray (2,) – midpoint of both shoulders, or None
 
         Returns
         -------
-        bbox_vel : float  – average pixel displacement per frame.
+        shoulder_vel : float  – average pixel displacement per frame.
         """
-        if bbox is not None:
-            centre = np.array([(bbox[0] + bbox[2]) / 2.0,
-                               (bbox[1] + bbox[3]) / 2.0])
-        else:
-            centre = None
+        self._shoulder_midpoints.append(shoulder_mid)
+        if len(self._shoulder_midpoints) > self.bbox_history_len + 2:
+            self._shoulder_midpoints.pop(0)
 
-        self._bbox_centres.append(centre)
-        if len(self._bbox_centres) > self.bbox_history_len + 2:
-            self._bbox_centres.pop(0)
-
-        if centre is None or len(self._bbox_centres) < 2:
+        if shoulder_mid is None or len(self._shoulder_midpoints) < 2:
             return 0.0
 
         vels = []
-        for i in range(1, min(self.bbox_history_len + 1, len(self._bbox_centres))):
-            prev = self._bbox_centres[-(i + 1)]
+        for i in range(1, min(self.bbox_history_len + 1, len(self._shoulder_midpoints))):
+            prev = self._shoulder_midpoints[-(i + 1)]
             if prev is not None:
-                vels.append(np.linalg.norm(centre - prev) / i)
+                vels.append(np.linalg.norm(shoulder_mid - prev) / i)
 
         return float(np.mean(vels)) if vels else 0.0
 
     # ------------------------------------------------------------------
     def _get_lookback_pos(self):
-        """Return wrist relative positions from ``pos_lookback`` frames ago.
+        """Return hand-mean relative positions from ``pos_lookback`` frames ago.
 
         If not enough history, return the earliest available frame.
-        Returns (lw_rel, rw_rel) – either may be None.
+        Returns (lh_rel, rh_rel) – either may be None.
         """
         lb = min(self.pos_lookback, len(self._prev_rel_positions))
         if lb == 0:
@@ -245,6 +263,7 @@ class PointingActionDetector:
         kpts : np.ndarray (48, 2)
         scores : np.ndarray (48,)
         bbox : np.ndarray (4,) or None  – person bbox [x1, y1, x2, y2].
+            (kept for API compatibility but NOT used for debounce)
         kpt_thr : float
 
         Returns
@@ -255,9 +274,7 @@ class PointingActionDetector:
         # --- No bbox → skip detection entirely ---
         if bbox is None:
             self._prev_rel_positions.append((None, None))
-            self._bbox_centres.append(None)
-            if len(self._bbox_centres) > self.bbox_history_len + 2:
-                self._bbox_centres.pop(0)
+            self._shoulder_midpoints.append(None)
             # Reset state machine so next valid frame starts from IDLE
             self.state = self.IDLE
             self._confirm_count = 0
@@ -265,29 +282,41 @@ class PointingActionDetector:
             self._last_transition_pos = None
             return self.NO_BBOX, {
                 "reason": "no_bbox",
+                "shoulder_vel": 0.0,
                 "bbox_vel": 0.0,
                 "active_side": self._active_side,
+                "shoulder_mid": None,
+                "left_hand_mean": None,
+                "right_hand_mean": None,
             }
 
-        # --- Bbox stability check (with consecutive-frame confirmation) ---
-        bbox_vel = self._bbox_velocity(bbox)
-        bbox_over_thr = bbox_vel >= self.bbox_vel_thr
-
-        anchor, lw_rel, rw_rel, anchor_scale = self._compute_anchor_and_rel(
-            kpts, scores, kpt_thr
-        )
+        # --- Compute anchor and hand means ---
+        result = self._compute_anchor_and_rel(kpts, scores, kpt_thr)
+        anchor, lh_rel, rh_rel, anchor_scale, hand_means = result
 
         if anchor is None:
             self._prev_rel_positions.append((None, None))
+            self._shoulder_midpoints.append(None)
             return self.state, {
                 "reason": "shoulders_not_visible",
-                "bbox_vel": round(bbox_vel, 3),
+                "shoulder_vel": 0.0,
+                "bbox_vel": 0.0,
                 "active_side": self._active_side,
+                "shoulder_mid": None,
+                "left_hand_mean": None,
+                "right_hand_mean": None,
             }
 
-        vel_left = self._velocity(lw_rel, "left")
-        vel_right = self._velocity(rw_rel, "right")
+        # --- Shoulder midpoint stability check (replaces bbox) ---
+        shoulder_vel = self._shoulder_velocity(anchor.copy())
+        shoulder_over_thr = shoulder_vel >= self.bbox_vel_thr
+
+        vel_left = self._velocity(lh_rel, "left")
+        vel_right = self._velocity(rh_rel, "right")
         ratio, faster_side = self._vel_ratio(vel_left, vel_right)
+
+        # Unpack hand means for visualization
+        lh_mean_px, rh_mean_px = hand_means if hand_means else (None, None)
 
         debug = {
             "vel_left": round(vel_left, 5),
@@ -296,18 +325,20 @@ class PointingActionDetector:
             "faster_side": faster_side,
             "anchor_scale": round(anchor_scale, 2),
             "state_before": self.state,
-            "bbox_vel": round(bbox_vel, 3),
+            "shoulder_vel": round(shoulder_vel, 3),
+            "bbox_vel": round(shoulder_vel, 3),  # backward-compat alias
             "active_side": self._active_side,
+            "shoulder_mid": anchor.tolist() if anchor is not None else None,
+            "left_hand_mean": lh_mean_px.tolist() if lh_mean_px is not None else None,
+            "right_hand_mean": rh_mean_px.tolist() if rh_mean_px is not None else None,
         }
 
-        # --- Bbox change state machine (needs confirm_frames consecutive frames) ---
+        # --- Shoulder-change state machine (needs confirm_frames consecutive frames) ---
         if self.state == self.BBOX_CHANGE:
-            # Already in BBOX_CHANGE: wait for confirm_frames consecutive stable frames
-            if not bbox_over_thr:
+            if not shoulder_over_thr:
                 self._bbox_stable_count += 1
                 self._bbox_confirm_count = 0
                 if self._bbox_stable_count >= self.confirm_frames:
-                    # Transition back to IDLE
                     self.state = self.IDLE
                     self._bbox_stable_count = 0
                     self._confirm_count = 0
@@ -317,15 +348,13 @@ class PointingActionDetector:
                 self._bbox_stable_count = 0
                 self._bbox_confirm_count = 0
 
-            # While in BBOX_CHANGE, skip normal action detection
             debug["state_after"] = self.state if self.state != self.IDLE else self.IDLE
-            debug["bbox_unstable"] = True
+            debug["shoulder_unstable"] = True
 
-            self._prev_rel_positions.append((lw_rel, rw_rel))
+            self._prev_rel_positions.append((lh_rel, rh_rel))
             if len(self._prev_rel_positions) > self.history_len + 2:
                 self._prev_rel_positions.pop(0)
 
-            # If we just transitioned back to IDLE, report IDLE; otherwise BBOX_CHANGE
             if self.state == self.IDLE:
                 debug["state_after"] = self.IDLE
                 return self.IDLE, debug
@@ -333,26 +362,23 @@ class PointingActionDetector:
                 debug["state_after"] = self.BBOX_CHANGE
                 return self.BBOX_CHANGE, debug
         else:
-            # Not in BBOX_CHANGE yet: count consecutive over-threshold frames
-            if bbox_over_thr:
+            if shoulder_over_thr:
                 self._bbox_confirm_count += 1
                 self._bbox_stable_count = 0
                 if self._bbox_confirm_count >= self.confirm_frames:
-                    # Enter BBOX_CHANGE state
-                    self.state = self.IDLE  # internal state reset
+                    self.state = self.IDLE
                     self._confirm_count = 0
                     self._active_side = None
                     self._last_transition_pos = None
                     self._bbox_confirm_count = 0
 
                     debug["state_after"] = self.BBOX_CHANGE
-                    debug["bbox_unstable"] = True
+                    debug["shoulder_unstable"] = True
 
-                    self._prev_rel_positions.append((lw_rel, rw_rel))
+                    self._prev_rel_positions.append((lh_rel, rh_rel))
                     if len(self._prev_rel_positions) > self.history_len + 2:
                         self._prev_rel_positions.pop(0)
 
-                    # Mark state as BBOX_CHANGE for next frame's check
                     self.state = self.BBOX_CHANGE
                     return self.BBOX_CHANGE, debug
             else:
@@ -369,11 +395,11 @@ class PointingActionDetector:
             and max(vel_left, vel_right) < self.vel_min
         )
 
-        # Current wrist positions snapshot (for position-diff check)
-        cur_pos = (lw_rel, rw_rel)
+        # Current hand-mean positions snapshot (for position-diff check)
+        cur_pos = (lh_rel, rh_rel)
 
         def _pos_changed_enough():
-            """Check if wrists moved enough since the last recorded transition."""
+            """Check if hand-means moved enough since the last recorded transition."""
             if self._last_transition_pos is None:
                 return True, float("inf")
             dists = []
@@ -391,11 +417,10 @@ class PointingActionDetector:
             debug["pos_diff"] = round(dist, 4) if dist != float("inf") else None
             if ok:
                 self.state = new_state
-                # Use position from ``pos_lookback`` frames ago instead of current
-                lb_lw, lb_rw = self._get_lookback_pos()
+                lb_lh, lb_rh = self._get_lookback_pos()
                 self._last_transition_pos = (
-                    lb_lw.copy() if lb_lw is not None else None,
-                    lb_rw.copy() if lb_rw is not None else None,
+                    lb_lh.copy() if lb_lh is not None else None,
+                    lb_rh.copy() if lb_rh is not None else None,
                 )
                 debug["pos_check"] = "pass"
             else:
@@ -444,7 +469,7 @@ class PointingActionDetector:
         debug["active_side"] = self._active_side
 
         # Update history (keep bounded)
-        self._prev_rel_positions.append((lw_rel, rw_rel))
+        self._prev_rel_positions.append((lh_rel, rh_rel))
         if len(self._prev_rel_positions) > self.history_len + 2:
             self._prev_rel_positions.pop(0)
 
@@ -715,7 +740,7 @@ def main():
         PointingActionDetector.RAISING:     "raising",
         PointingActionDetector.POINTING:    "pointing",
         PointingActionDetector.LOWERING:    "lowering",
-        PointingActionDetector.BBOX_CHANGE: "bbox_change",
+        PointingActionDetector.BBOX_CHANGE: "shoulder_change",
         PointingActionDetector.NO_BBOX:     "no_bbox",
     }
 
@@ -797,6 +822,26 @@ def main():
             )
             vis_image = cv2.cvtColor(vis_image_rgb, cv2.COLOR_RGB2BGR)
 
+            # --- Draw shoulder midpoint (cyan diamond) ---
+            shoulder_mid = action_debug.get("shoulder_mid")
+            if shoulder_mid is not None:
+                sm = (int(round(shoulder_mid[0])), int(round(shoulder_mid[1])))
+                cv2.drawMarker(vis_image, sm, (255, 255, 0), cv2.MARKER_DIAMOND, 16, 2)
+
+            # --- Draw hand mean points (left=green circle, right=blue circle) ---
+            lh_mean = action_debug.get("left_hand_mean")
+            rh_mean = action_debug.get("right_hand_mean")
+            if lh_mean is not None:
+                lhp = (int(round(lh_mean[0])), int(round(lh_mean[1])))
+                cv2.circle(vis_image, lhp, 12, (0, 255, 0), 3)
+                cv2.putText(vis_image, "LH", (lhp[0] + 14, lhp[1] + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+            if rh_mean is not None:
+                rhp = (int(round(rh_mean[0])), int(round(rh_mean[1])))
+                cv2.circle(vis_image, rhp, 12, (255, 100, 0), 3)
+                cv2.putText(vis_image, "RH", (rhp[0] + 14, rhp[1] + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 100, 0), 1, cv2.LINE_AA)
+
             # --- Draw action label on the image ---
             side_str = action_debug.get("active_side") or ""
             side_suffix = f" [{side_str}]" if side_str else ""
@@ -807,8 +852,8 @@ def main():
                 f"vR={action_debug.get('vel_right', 0):.4f}  "
                 f"ratio={action_debug.get('vel_ratio', 0):.2f}"
             )
-            bbox_vel_val = action_debug.get("bbox_vel", 0.0)
-            bbox_text = f"bbox_vel={bbox_vel_val:.3f}"
+            shoulder_vel_val = action_debug.get("shoulder_vel", 0.0)
+            shoulder_text = f"shoulder_vel={shoulder_vel_val:.3f}"
             pos_diff_val = action_debug.get('pos_diff', None)
             pos_text = (
                 f"pos_diff={pos_diff_val:.4f}  {action_debug.get('pos_check', '')}"
@@ -826,8 +871,8 @@ def main():
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1, cv2.LINE_AA,
             )
             cv2.putText(
-                vis_image, bbox_text, (20, 85),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 100), 1, cv2.LINE_AA,
+                vis_image, shoulder_text, (20, 85),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 100), 1, cv2.LINE_AA,
             )
             if pos_text:
                 cv2.putText(
@@ -853,7 +898,7 @@ def main():
                     "active_side": action_debug.get("active_side", None),
                     "action_debug": {
                         k: v for k, v in action_debug.items()
-                        if isinstance(v, (int, float, str, type(None)))
+                        if isinstance(v, (int, float, str, list, type(None)))
                     },
                     "instances": instances,
                 })

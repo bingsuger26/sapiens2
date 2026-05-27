@@ -13,12 +13,13 @@ import numpy as np
 
 # State → color mapping (consistent with HUD colours)
 _STATE_COLORS = {
-    "idle":        "#C8C8C8",
-    "raising":     "#FFC800",
-    "pointing":    "#00FF00",
-    "lowering":    "#FF0000",
-    "bbox_change": "#FF00FF",
-    "no_bbox":     "#808080",
+    "idle":             "#C8C8C8",
+    "raising":          "#FFC800",
+    "pointing":         "#00FF00",
+    "lowering":         "#FF0000",
+    "bbox_change":      "#FF00FF",
+    "shoulder_change":  "#FF00FF",
+    "no_bbox":          "#808080",
 }
 
 
@@ -94,10 +95,10 @@ def plot_action_metrics(
     # ---- Panel 4: Bbox velocity ----
     ax = axes[3]
     _draw_state_bands(ax, frames, states)
-    ax.plot(frames, bbox_vels, color="darkorchid", linewidth=1.0, label="bbox_vel")
+    ax.plot(frames, bbox_vels, color="darkorchid", linewidth=1.0, label="shoulder_vel")
     ax.axhline(y=bbox_vel_thr, color="magenta", linestyle="--", linewidth=0.8,
-               label=f"bbox_vel_thr={bbox_vel_thr}")
-    ax.set_ylabel("Bbox Velocity (px/frame)")
+               label=f"shoulder_vel_thr={bbox_vel_thr}")
+    ax.set_ylabel("Shoulder Velocity (px/frame)")
     ax.set_ylim(bottom=0, top=max(bbox_vels.max() * 1.2, bbox_vel_thr * 1.5) if bbox_vels.max() > 0 else bbox_vel_thr * 2)
     ax.legend(loc="upper right", fontsize=8)
     ax.grid(True, alpha=0.3)
@@ -151,14 +152,15 @@ def _draw_state_timeline(ax, frames, states, sides):
     The active side ("L" / "R") is annotated at the centre of each bar.
     """
     _state_to_y = {
-        "idle":        0,
-        "raising":     1,
-        "pointing":    2,
-        "lowering":    3,
-        "bbox_change": 4,
-        "no_bbox":     5,
+        "idle":             0,
+        "raising":          1,
+        "pointing":         2,
+        "lowering":         3,
+        "bbox_change":      4,
+        "shoulder_change":  4,
+        "no_bbox":          5,
     }
-    state_names = list(_state_to_y.keys())
+    state_names = ["idle", "raising", "pointing", "lowering", "shoulder_change", "no_bbox"]
 
     # Identify contiguous runs
     runs = []  # list of (start_frame, end_frame, state, dominant_side)
@@ -185,12 +187,118 @@ def _draw_state_timeline(ax, frames, states, sides):
         ax.barh(y, width, left=fs, height=bar_height, color=color, alpha=0.6,
                 edgecolor="black", linewidth=0.3)
         # Annotate side
-        if side and st not in ("idle", "bbox_change", "no_bbox"):
+        if side and st not in ("idle", "bbox_change", "shoulder_change", "no_bbox"):
             side_label = "L" if side == "left" else "R"
             mid_x = fs + width / 2.0
             ax.text(mid_x, y, side_label, ha="center", va="center",
                     fontsize=7, fontweight="bold", color="black")
 
-    ax.set_yticks(list(_state_to_y.values()))
+    ax.set_yticks(list(range(len(state_names))))
     ax.set_yticklabels(state_names, fontsize=8)
     ax.set_ylim(-0.5, len(state_names) - 0.5)
+
+
+# ---------------------------------------------------------------------------
+# Summary distribution plot (aggregated across all clips)
+# ---------------------------------------------------------------------------
+
+def plot_summary_distribution(
+    all_metrics: List[Dict],
+    output_path: str,
+    ratio_thr: float = 2.8,
+    vel_min: float = 0.025,
+    title: Optional[str] = None,
+):
+    """Generate a summary plot showing arm velocity and ratio distributions
+    across ALL processed clips.
+
+    Parameters
+    ----------
+    all_metrics : list[dict]
+        Concatenated per-frame metrics from all clips.  Each dict contains:
+            vel_ratio, vel_left, vel_right, state, active_side, etc.
+    output_path : str
+        Path to save the summary figure.
+    ratio_thr : float
+        Ratio threshold line to draw on the distribution.
+    vel_min : float
+        Velocity minimum threshold line.
+    title : str, optional
+    """
+    if not all_metrics:
+        return
+
+    ratios = np.array([m["vel_ratio"] for m in all_metrics])
+    vel_left = np.array([m["vel_left"] for m in all_metrics])
+    vel_right = np.array([m["vel_right"] for m in all_metrics])
+    vel_max = np.maximum(vel_left, vel_right)
+    states = [m["state"] for m in all_metrics]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # ---- Panel (0,0): Ratio histogram ----
+    ax = axes[0, 0]
+    ax.hist(ratios, bins=80, color="royalblue", alpha=0.7, edgecolor="black", linewidth=0.3)
+    ax.axvline(x=ratio_thr, color="red", linestyle="--", linewidth=1.5,
+               label=f"ratio_thr={ratio_thr}")
+    ax.set_xlabel("Velocity Ratio (faster / slower)")
+    ax.set_ylabel("Frame Count")
+    ax.set_title("Velocity Ratio Distribution")
+    ax.legend(loc="upper right", fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # ---- Panel (0,1): Max arm velocity histogram ----
+    ax = axes[0, 1]
+    ax.hist(vel_max, bins=80, color="darkorange", alpha=0.7, edgecolor="black", linewidth=0.3)
+    ax.axvline(x=vel_min, color="red", linestyle="--", linewidth=1.5,
+               label=f"vel_min={vel_min}")
+    ax.set_xlabel("Max Hand Velocity (normalised)")
+    ax.set_ylabel("Frame Count")
+    ax.set_title("Max Hand Velocity Distribution")
+    ax.legend(loc="upper right", fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # ---- Panel (1,0): Left vs Right velocity scatter (colored by state) ----
+    ax = axes[1, 0]
+    for state_name, color in _STATE_COLORS.items():
+        mask = [s == state_name for s in states]
+        if any(mask):
+            idx = np.where(mask)[0]
+            ax.scatter(vel_left[idx], vel_right[idx], c=color, alpha=0.3, s=8,
+                       label=state_name, edgecolors="none")
+    ax.set_xlabel("Left Hand Velocity")
+    ax.set_ylabel("Right Hand Velocity")
+    ax.set_title("Left vs Right Hand Velocity (by state)")
+    ax.legend(loc="upper right", fontsize=8, markerscale=3)
+    ax.grid(True, alpha=0.3)
+    # Draw identity line
+    lim = max(vel_left.max(), vel_right.max()) * 1.1 if vel_left.max() > 0 else 0.1
+    ax.plot([0, lim], [0, lim], "k--", linewidth=0.5, alpha=0.5)
+    ax.set_xlim(0, lim)
+    ax.set_ylim(0, lim)
+
+    # ---- Panel (1,1): Ratio vs Max velocity scatter (colored by state) ----
+    ax = axes[1, 1]
+    for state_name, color in _STATE_COLORS.items():
+        mask = [s == state_name for s in states]
+        if any(mask):
+            idx = np.where(mask)[0]
+            ax.scatter(vel_max[idx], ratios[idx], c=color, alpha=0.3, s=8,
+                       label=state_name, edgecolors="none")
+    ax.axhline(y=ratio_thr, color="red", linestyle="--", linewidth=1.0, alpha=0.7)
+    ax.axvline(x=vel_min, color="green", linestyle="--", linewidth=1.0, alpha=0.7)
+    ax.set_xlabel("Max Hand Velocity")
+    ax.set_ylabel("Velocity Ratio")
+    ax.set_title("Ratio vs Max Velocity (by state)")
+    ax.legend(loc="upper right", fontsize=8, markerscale=3)
+    ax.grid(True, alpha=0.3)
+
+    if title is None:
+        title = "Summary: Arm Velocity & Ratio Distribution"
+    fig.suptitle(title, fontsize=12, y=1.01)
+
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot_metrics] wrote summary distribution: {output_path}")
