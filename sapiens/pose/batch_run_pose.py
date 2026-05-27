@@ -73,7 +73,7 @@ DATA_ROOT = "/home/sanmeng/models/sapiens2/sapiens/pose/outputs/resized_img"
 OUTPUT_ROOT = "/home/sanmeng/output"
 
 DET_CONFIG = os.path.join(POSE_DIR, "tools/vis/rtmdet_m_640-8xb32_coco-person.py")
-DET_CKPT = "/home/sanmeng/models/sapiens2/sapiens2_host/detector/rtmdet_m_8xb32-100e_coco-obj365-person-235e8209.pth"
+DET_CKPT = "/home/perception_public/epm/weights/HF/sapiens2_host/detector/rtmdet_m_8xb32-100e_coco-obj365-person-235e8209.pth"
 POSE_CONFIG = os.path.join(
     POSE_DIR,
     "configs/keypoints308/shutterstock_goliath_3po/"
@@ -84,7 +84,7 @@ POSE_CONFIG_FAST = os.path.join(
     "configs/keypoints308/shutterstock_goliath_3po/"
     "sapiens2_0.4b_keypoints308_shutterstock_goliath_3po-512x384.py",
 )
-POSE_CKPT = "/home/sanmeng/models/sapiens2/sapiens2_host/sapiens2_0.4b_pose.safetensors"
+POSE_CKPT = "/home/perception_public/epm/weights/HF/sapiens2_host/sapiens2_0.4b_pose.safetensors"
 
 
 # ---------------------------------------------------------------------------

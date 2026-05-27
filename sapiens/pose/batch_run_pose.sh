@@ -27,9 +27,9 @@ PYTHON="/home/sanmeng/envs/sapiens2/bin/python"
 
 # Model configs / checkpoints (same as launch.json)
 DET_CONFIG="${POSE_DIR}/tools/vis/rtmdet_m_640-8xb32_coco-person.py"
-DET_CKPT="/home/sanmeng/models/sapiens2/sapiens2_host/detector/rtmdet_m_8xb32-100e_coco-obj365-person-235e8209.pth"
+DET_CKPT="/home/perception_public/epm/weights/HF/sapiens2_host/detector/rtmdet_m_8xb32-100e_coco-obj365-person-235e8209.pth"
 POSE_CONFIG="${POSE_DIR}/configs/keypoints308/shutterstock_goliath_3po/sapiens2_0.4b_keypoints308_shutterstock_goliath_3po-512x384.py"
-POSE_CKPT="/home/sanmeng/models/sapiens2/sapiens2_host/sapiens2_0.4b_pose.safetensors"
+POSE_CKPT="/home/perception_public/epm/weights/HF/sapiens2_host/sapiens2_0.4b_pose.safetensors"
 
 # Inference params
 RADIUS=8
